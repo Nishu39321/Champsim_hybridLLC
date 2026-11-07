@@ -1,0 +1,61 @@
+{
+  "executable_name": "champsim-dam-dvs",
+  "num_cores": 1,
+  "ooo_cpu": [
+    {
+      "frequency": 2660,
+      "rob_size": 128,
+      "fetch_width": 4,
+      "decode_width": 4,
+      "dispatch_width": 4,
+      "execute_width": 4,
+      "retire_width": 4,
+      "L1I": {
+        "sets": 128,
+        "ways": 4,
+        "latency": 4
+      },
+      "L1D": {
+        "sets": 64,
+        "ways": 8,
+        "latency": 4
+      },
+      "L2C": {
+        "sets": 512,
+        "ways": 8,
+        "latency": 8
+      }
+    }
+  ],
+  "LLC": {
+    "sets": 8192,
+    "ways": 16,
+    "hit_latency": 1,
+    "fill_latency": 1,
+    "max_tag_check": 8,
+    "max_fill": 8,
+    "mshr_size": 64,
+    "hybrid_llc": true,
+    "sram_ways": 4,
+    "sram_read_latency": 30,
+    "sram_write_latency": 30,
+    "sttram_read_latency": 30,
+    "sttram_write_latency": 120,
+    "sram_read_ports": 8,
+    "sram_write_ports": 8,
+    "sttram_read_ports": 8,
+    "sttram_write_ports": 8,
+    "hybrid_policy": "read_stt_write_sram",
+    "phc_predictor": true,
+    "phc_threshold": 20,
+    "phc_read_delta": -1,
+    "phc_write_delta": 24,
+    "phc_sampler_period": 32,
+    "dam_dvs": true,
+    "dam_rst_init": 128,
+    "dam_threshold_a": 64,
+    "dam_threshold_b": 128,
+    "dam_dueling_phase": 4096,
+    "replacement": "hybrid_lru"
+  }
+}

@@ -15,6 +15,20 @@ long hybrid_lru::find_victim(uint32_t, uint64_t, long set, const champsim::cache
   assert(first_way < last_way);
   auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY + first_way);
   auto end = std::next(std::begin(last_used_cycles), set * NUM_WAY + last_way);
+
+  // DAM DVS (Stage 2): prefer a predicted-dead block in the target portion
+  // (the least recently used one if there are several); otherwise plain LRU.
+  if (cache->dam_dvs_enabled()) {
+    long dead_way = -1;
+    for (long way = first_way; way < last_way; ++way) {
+      if (cache->dam_block_dead(set, way)
+          && (dead_way < 0 || last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + way)) < last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + dead_way))))
+        dead_way = way;
+    }
+    if (dead_way >= 0)
+      return dead_way;
+  }
+
   auto victim = std::min_element(begin, end);
   return first_way + std::distance(begin, victim);
 }

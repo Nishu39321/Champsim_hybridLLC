@@ -105,7 +105,12 @@ cache_builder_parts = {
     'phc_threshold': '.phc_threshold({phc_threshold})',
     'phc_read_delta': '.phc_read_delta({phc_read_delta})',
     'phc_write_delta': '.phc_write_delta({phc_write_delta})',
-    'phc_sampler_period': '.phc_sampler_period({phc_sampler_period})'
+    'phc_sampler_period': '.phc_sampler_period({phc_sampler_period})',
+    'dam_dvs': '.set_dam_dvs()',
+    'dam_rst_init': '.dam_rst_init({dam_rst_init})',
+    'dam_threshold_a': '.dam_threshold_a({dam_threshold_a})',
+    'dam_threshold_b': '.dam_threshold_b({dam_threshold_b})',
+    'dam_dueling_phase': '.dam_dueling_phase({dam_dueling_phase})'
 }
 
 ptw_builder_parts = {

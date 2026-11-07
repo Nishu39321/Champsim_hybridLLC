@@ -167,7 +167,15 @@ private:
     uint16_t trigger_index = 0;
     int16_t cost = 0;
     uint64_t last_used = 0;
+    uint8_t dam_pc = 0; // 8-bit XOR-hashed PC for the DAM dead-block predictor
   };
+
+  // DAM dead-block predictor helpers (Stage 2)
+  static uint8_t dam_hash_pc(champsim::address ip);
+  int dam_leader(long set) const; // 0 = follower, 1 = leader for threshold A, 2 = leader for threshold B
+  uint32_t dam_threshold_for_set(long set) const;
+  void dam_record_demand_miss(long set);
+  void dam_note_eviction(long set, long way);
 
   struct delayed_response {
     champsim::chrono::clock::time_point ready_at;
@@ -209,6 +217,26 @@ public:
   std::vector<uint8_t> phc_predictor{};
   std::vector<phc_sampler_entry> phc_sampler{};
   uint64_t phc_sampler_clock = 0;
+
+  // DAM PC-based dead-block predictor + DVS state (Stage 2).
+  struct dam_state_type {
+    bool enabled = false;
+    uint32_t rst_init = 128;
+    uint32_t threshold_a = 64;   // leader group A threshold
+    uint32_t threshold_b = 128;  // leader group B threshold
+    uint32_t phase_length = 4096; // demand misses per set-dueling phase
+    std::vector<uint8_t> rst{};          // 256-entry, 8-bit reuse-state table
+    std::vector<uint8_t> block_pc{};     // per-block 8-bit hashed PC of the instruction that brought it in
+    std::vector<uint8_t> block_has_pc{}; // 0 for lines with no trigger PC (e.g. writeback fills): never predicted dead
+    uint64_t leader_misses_a = 0, leader_misses_b = 0, phase_misses = 0;
+    bool followers_use_b = false;
+  };
+  dam_state_type dam{};
+
+  /** True if DAM dead-block victim selection is enabled. */
+  [[nodiscard]] bool dam_dvs_enabled() const { return dam.enabled; }
+  /** True if the valid block at (set, way) is predicted dead by the reuse-state table. */
+  [[nodiscard]] bool dam_block_dead(long set, long way) const;
 
   using stats_type = cache_stats;
 
@@ -387,6 +415,20 @@ public:
     if (PHC_PREDICTOR) {
       phc_predictor.assign(4096, 1); // weakly cold
       phc_sampler.resize(static_cast<std::size_t>(NUM_SET / PHC_SAMPLER_PERIOD) * NUM_WAY);
+    }
+    if (b.m_dam_dvs) {
+      if (!PHC_PREDICTOR)
+        throw std::invalid_argument{"dam_dvs requires phc_predictor: the dead-block predictor is trained by the shared sampler"};
+      if (NUM_SET < 64)
+        throw std::invalid_argument{"dam_dvs requires at least 64 sets for the set-dueling leader groups"};
+      dam.enabled = true;
+      dam.rst_init = std::min(255u, b.m_dam_rst_init);
+      dam.threshold_a = std::min(256u, b.m_dam_threshold_a);
+      dam.threshold_b = std::min(256u, b.m_dam_threshold_b);
+      dam.phase_length = std::max(1u, b.m_dam_dueling_phase);
+      dam.rst.assign(256, static_cast<uint8_t>(dam.rst_init));
+      dam.block_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
+      dam.block_has_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
     }
   }
 

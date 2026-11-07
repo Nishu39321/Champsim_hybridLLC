@@ -1,0 +1,704 @@
+diff --git a/config/instantiation_file.py b/config/instantiation_file.py
+index 2e79d05..cf6c44f 100644
+--- a/config/instantiation_file.py
++++ b/config/instantiation_file.py
+@@ -105,7 +105,12 @@ cache_builder_parts = {
+     'phc_threshold': '.phc_threshold({phc_threshold})',
+     'phc_read_delta': '.phc_read_delta({phc_read_delta})',
+     'phc_write_delta': '.phc_write_delta({phc_write_delta})',
+-    'phc_sampler_period': '.phc_sampler_period({phc_sampler_period})'
++    'phc_sampler_period': '.phc_sampler_period({phc_sampler_period})',
++    'dam_dvs': '.set_dam_dvs()',
++    'dam_rst_init': '.dam_rst_init({dam_rst_init})',
++    'dam_threshold_a': '.dam_threshold_a({dam_threshold_a})',
++    'dam_threshold_b': '.dam_threshold_b({dam_threshold_b})',
++    'dam_dueling_phase': '.dam_dueling_phase({dam_dueling_phase})'
+ }
+ 
+ ptw_builder_parts = {
+diff --git a/configs/README-dam-phc-stage1.md b/configs/README-dam-phc-stage1.md
+index 7809bb9..0cef357 100644
+--- a/configs/README-dam-phc-stage1.md
++++ b/configs/README-dam-phc-stage1.md
+@@ -60,3 +60,27 @@ for c in sram_only sttram_only phc_wip; do
+   ./config.sh configs/dam_$c.json && make -j8 || break
+ done
+ ```
++
++## Stage 2: DAM dead-block predictor + DVS (`dam_dvs.json`)
++
++Placement is unchanged from Stage 1 (PHC's 4,096-entry write-intensity table).
++Stage 2 changes only victim selection:
++
++* **Dead-block predictor (DAM Sec. 3).** A 256-entry, 8-bit reuse-state table
++  (RST) indexed by an 8-bit XOR hash of the PC. Every LLC block stores the
++  hashed PC of the instruction that brought it in (writeback fills have no PC
++  and are never predicted dead). The RST is trained by the shared 1/32-set
++  sampler: a demand hit to a sampled block increments its PC's entry, and a
++  block evicted from the sampler decrements it. A block is predicted dead
++  when `RST[pc] < threshold`.
++* **Set-dueling threshold.** 32 leader sets use `dam_threshold_a` (64) and 32
++  use `dam_threshold_b` (128); every `dam_dueling_phase` (4,096) demand misses
++  the group with fewer misses sets the threshold for all other sets.
++* **DVS.** On a fill, an invalid way in the chosen portion is used first; then
++  the least recently used predicted-dead block in that portion; otherwise
++  plain LRU in that portion. No migration yet (Stage 3).
++
++New statistics: `DAM dead victims`, `DAM LRU victims`, `DAM dead in other
++portion` (LRU evictions where a dead block existed in the *other* portion:
++the opportunity Stage 3's migration targets), RST training counts and the
++number of set-dueling phases won by threshold B.
+diff --git a/inc/cache.h b/inc/cache.h
+index 43d186e..326ee08 100644
+--- a/inc/cache.h
++++ b/inc/cache.h
+@@ -167,8 +167,16 @@ private:
+     uint16_t trigger_index = 0;
+     int16_t cost = 0;
+     uint64_t last_used = 0;
++    uint8_t dam_pc = 0; // 8-bit XOR-hashed PC for the DAM dead-block predictor
+   };
+ 
++  // DAM dead-block predictor helpers (Stage 2)
++  static uint8_t dam_hash_pc(champsim::address ip);
++  int dam_leader(long set) const; // 0 = follower, 1 = leader for threshold A, 2 = leader for threshold B
++  uint32_t dam_threshold_for_set(long set) const;
++  void dam_record_demand_miss(long set);
++  void dam_note_eviction(long set, long way);
++
+   struct delayed_response {
+     champsim::chrono::clock::time_point ready_at;
+     response_type response;
+@@ -210,6 +218,26 @@ public:
+   std::vector<phc_sampler_entry> phc_sampler{};
+   uint64_t phc_sampler_clock = 0;
+ 
++  // DAM PC-based dead-block predictor + DVS state (Stage 2).
++  struct dam_state_type {
++    bool enabled = false;
++    uint32_t rst_init = 128;
++    uint32_t threshold_a = 64;   // leader group A threshold
++    uint32_t threshold_b = 128;  // leader group B threshold
++    uint32_t phase_length = 4096; // demand misses per set-dueling phase
++    std::vector<uint8_t> rst{};          // 256-entry, 8-bit reuse-state table
++    std::vector<uint8_t> block_pc{};     // per-block 8-bit hashed PC of the instruction that brought it in
++    std::vector<uint8_t> block_has_pc{}; // 0 for lines with no trigger PC (e.g. writeback fills): never predicted dead
++    uint64_t leader_misses_a = 0, leader_misses_b = 0, phase_misses = 0;
++    bool followers_use_b = false;
++  };
++  dam_state_type dam{};
++
++  /** True if DAM dead-block victim selection is enabled. */
++  [[nodiscard]] bool dam_dvs_enabled() const { return dam.enabled; }
++  /** True if the valid block at (set, way) is predicted dead by the reuse-state table. */
++  [[nodiscard]] bool dam_block_dead(long set, long way) const;
++
+   using stats_type = cache_stats;
+ 
+   stats_type sim_stats, roi_stats;
+@@ -388,6 +416,20 @@ public:
+       phc_predictor.assign(4096, 1); // weakly cold
+       phc_sampler.resize(static_cast<std::size_t>(NUM_SET / PHC_SAMPLER_PERIOD) * NUM_WAY);
+     }
++    if (b.m_dam_dvs) {
++      if (!PHC_PREDICTOR)
++        throw std::invalid_argument{"dam_dvs requires phc_predictor: the dead-block predictor is trained by the shared sampler"};
++      if (NUM_SET < 64)
++        throw std::invalid_argument{"dam_dvs requires at least 64 sets for the set-dueling leader groups"};
++      dam.enabled = true;
++      dam.rst_init = std::min(255u, b.m_dam_rst_init);
++      dam.threshold_a = std::min(256u, b.m_dam_threshold_a);
++      dam.threshold_b = std::min(256u, b.m_dam_threshold_b);
++      dam.phase_length = std::max(1u, b.m_dam_dueling_phase);
++      dam.rst.assign(256, static_cast<uint8_t>(dam.rst_init));
++      dam.block_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
++      dam.block_has_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
++    }
+   }
+ 
+   CACHE(const CACHE&) = delete;
+diff --git a/inc/cache_builder.h b/inc/cache_builder.h
+index 50698ae..b5a4d4d 100644
+--- a/inc/cache_builder.h
++++ b/inc/cache_builder.h
+@@ -75,6 +75,11 @@ struct cache_builder_base {
+   int32_t m_phc_read_delta{-1};
+   int32_t m_phc_write_delta{24};
+   uint32_t m_phc_sampler_period{32};
++  bool m_dam_dvs{};
++  uint32_t m_dam_rst_init{128};
++  uint32_t m_dam_threshold_a{64};
++  uint32_t m_dam_threshold_b{128};
++  uint32_t m_dam_dueling_phase{4096};
+ 
+   std::vector<access_type> m_pref_act_mask{access_type::LOAD, access_type::PREFETCH};
+   std::vector<champsim::channel*> m_uls{};
+@@ -257,6 +262,13 @@ public:
+   self_type& phc_write_delta(int32_t delta_);
+   self_type& phc_sampler_period(uint32_t period_);
+ 
++  /** Enable DAM's PC-based dead-block predictor and dead-block victim selection (DVS). */
++  self_type& set_dam_dvs();
++  self_type& dam_rst_init(uint32_t value_);
++  self_type& dam_threshold_a(uint32_t value_);
++  self_type& dam_threshold_b(uint32_t value_);
++  self_type& dam_dueling_phase(uint32_t value_);
++
+   /**
+    * Specify the ``access_type`` values that should activate the prefetcher.
+    */
+@@ -644,6 +656,42 @@ auto champsim::cache_builder<P, R>::phc_sampler_period(uint32_t period_) -> self
+   return *this;
+ }
+ 
++template <typename P, typename R>
++auto champsim::cache_builder<P, R>::set_dam_dvs() -> self_type&
++{
++  m_hybrid_llc = true;
++  m_dam_dvs = true;
++  return *this;
++}
++
++template <typename P, typename R>
++auto champsim::cache_builder<P, R>::dam_rst_init(uint32_t value_) -> self_type&
++{
++  m_dam_rst_init = value_;
++  return *this;
++}
++
++template <typename P, typename R>
++auto champsim::cache_builder<P, R>::dam_threshold_a(uint32_t value_) -> self_type&
++{
++  m_dam_threshold_a = value_;
++  return *this;
++}
++
++template <typename P, typename R>
++auto champsim::cache_builder<P, R>::dam_threshold_b(uint32_t value_) -> self_type&
++{
++  m_dam_threshold_b = value_;
++  return *this;
++}
++
++template <typename P, typename R>
++auto champsim::cache_builder<P, R>::dam_dueling_phase(uint32_t value_) -> self_type&
++{
++  m_dam_dueling_phase = value_;
++  return *this;
++}
++
+ template <typename P, typename R>
+ template <typename... Elems>
+ auto champsim::cache_builder<P, R>::prefetch_activate(Elems... pref_act_elems) -> self_type&
+diff --git a/inc/cache_stats.h b/inc/cache_stats.h
+index 08a87f4..3f07694 100644
+--- a/inc/cache_stats.h
++++ b/inc/cache_stats.h
+@@ -26,6 +26,14 @@ struct cache_stats {
+   uint64_t phc_sttram_placements = 0;
+   uint64_t phc_hot_training_events = 0;
+   uint64_t phc_cold_training_events = 0;
++  // DAM dead-block predictor / DVS (Stage 2)
++  uint64_t dam_dead_victims = 0;         // evictions where DVS chose a predicted-dead block
++  uint64_t dam_lru_victims = 0;          // evictions with no dead block in the target portion (LRU fallback)
++  uint64_t dam_dead_in_other_portion = 0; // ...of those, a dead block existed in the other portion (Stage 3 opportunity)
++  uint64_t dam_reuse_training = 0;       // reuse-state table increments (sampler hits)
++  uint64_t dam_dead_training = 0;        // reuse-state table decrements (sampler evictions)
++  uint64_t dam_phases = 0;               // set-dueling phases completed
++  uint64_t dam_phases_b = 0;             // phases after which followers used threshold B
+ 
+   champsim::stats::event_counter<std::pair<access_type, std::remove_cv_t<decltype(NUM_CPUS)>>> hits = {};
+   champsim::stats::event_counter<std::pair<access_type, std::remove_cv_t<decltype(NUM_CPUS)>>> misses = {};
+diff --git a/replacement/hybrid_lru/hybrid_lru.cc b/replacement/hybrid_lru/hybrid_lru.cc
+index 9e88f31..0220f8a 100644
+--- a/replacement/hybrid_lru/hybrid_lru.cc
++++ b/replacement/hybrid_lru/hybrid_lru.cc
+@@ -15,6 +15,20 @@ long hybrid_lru::find_victim(uint32_t, uint64_t, long set, const champsim::cache
+   assert(first_way < last_way);
+   auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY + first_way);
+   auto end = std::next(std::begin(last_used_cycles), set * NUM_WAY + last_way);
++
++  // DAM DVS (Stage 2): prefer a predicted-dead block in the target portion
++  // (the least recently used one if there are several); otherwise plain LRU.
++  if (cache->dam_dvs_enabled()) {
++    long dead_way = -1;
++    for (long way = first_way; way < last_way; ++way) {
++      if (cache->dam_block_dead(set, way)
++          && (dead_way < 0 || last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + way)) < last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + dead_way))))
++        dead_way = way;
++    }
++    if (dead_way >= 0)
++      return dead_way;
++  }
++
+   auto victim = std::min_element(begin, end);
+   return first_way + std::distance(begin, victim);
+ }
+diff --git a/run_dam_phc_traces.zsh b/run_dam_phc_traces.zsh
+index 18539d6..86d5296 100755
+--- a/run_dam_phc_traces.zsh
++++ b/run_dam_phc_traces.zsh
+@@ -1,59 +1,42 @@
+ #!/bin/zsh
+-# Run the DAM-style SRAM-only, STT-RAM-only, and PHC-baseline configurations on
+-# every trace in TRACE_DIR, then collect the key metrics into one CSV.
++# Run the DAM-style hybrid-LLC configurations on every trace in TRACE_DIR and
++# collect the key metrics into one CSV.
+ #
+-#   WARMUP=10000000 SIMULATION=100000000 ./run_dam_phc_traces.zsh
++#   ./run_dam_phc_traces.zsh                              # all configs, one run at a time (live output)
++#   PARALLEL=1 JOBS=4 ./run_dam_phc_traces.zsh            # all configs, up to 4 runs at once (logs only)
++#   CONFIGS="dvs" PARALLEL=1 JOBS=4 ./run_dam_phc_traces.zsh   # only the selected configs
+ #
+-# PARALLEL=1 runs the three configurations of each trace at the same time
+-# (output goes only to the log files). PARALLEL=0 (default) runs one at a time
+-# and shows the live heartbeat output in the terminal.
++# Configs: sram_only sttram_only phc_wip dvs
++# WARMUP / SIMULATION set the instruction counts (default 10M / 100M).
+ 
+ set -euo pipefail
+ 
+-CHAMPSIM_DIR="/Users/nishuverma/Downloads/ChampSim"
++CHAMPSIM_DIR="${CHAMPSIM_DIR:-/Users/nishuverma/Downloads/ChampSim}"
+ TRACE_DIR="${TRACE_DIR:-/Users/nishuverma/Desktop/traces}"
+ WARMUP="${WARMUP:-10000000}"
+ SIMULATION="${SIMULATION:-100000000}"
+ PARALLEL="${PARALLEL:-0}"
+-RUN_ID="$(date '+%Y%m%d_%H%M%S')"
+-OUTDIR="${CHAMPSIM_DIR}/results/dam_phc_stage1_${RUN_ID}"
++JOBS="${JOBS:-3}"
++CONFIGS="${CONFIGS:-sram_only sttram_only phc_wip dvs}"
+ 
+-typeset -a config_names config_bins traces
+-config_names=(sram_only sttram_only phc_wip)
+-config_bins=(
+-  "${CHAMPSIM_DIR}/bin/champsim-dam-sram-only"
+-  "${CHAMPSIM_DIR}/bin/champsim-dam-sttram-only"
+-  "${CHAMPSIM_DIR}/bin/champsim-dam-phc-wip"
++typeset -A config_bin
++config_bin=(
++  sram_only   "${CHAMPSIM_DIR}/bin/champsim-dam-sram-only"
++  sttram_only "${CHAMPSIM_DIR}/bin/champsim-dam-sttram-only"
++  phc_wip     "${CHAMPSIM_DIR}/bin/champsim-dam-phc-wip"
++  dvs         "${CHAMPSIM_DIR}/bin/champsim-dam-dvs"
+ )
+-traces=("${TRACE_DIR}"/*.champsimtrace.xz(N))
+-
+-if (( ${#traces} == 0 )); then
+-  print -u2 "No .champsimtrace.xz files found in: ${TRACE_DIR}"
+-  exit 1
+-fi
+-
+-for bin in "${config_bins[@]}"; do
+-  if [[ ! -x "$bin" ]]; then
+-    print -u2 "Missing executable: $bin"
+-    print -u2 "Build the Stage-1 binaries before running this script."
+-    exit 1
+-  fi
+-done
+-
+-command -v jq >/dev/null || { print -u2 "jq is required to create the CSV."; exit 1; }
+-mkdir -p "$OUTDIR"
+-print "Results directory: ${OUTDIR}"
+-print "Warmup: ${WARMUP}  Simulation: ${SIMULATION}  Parallel: ${PARALLEL}"
+ 
+ run_one() {
+-  local workload="$1" config="$2" bin="$3" trace="$4"
+-  local log="${OUTDIR}/${workload}_${config}.log"
+-  local json="${OUTDIR}/${workload}_${config}.json"
++  local outdir="$1" workload="$2" config="$3" trace="$4"
++  local bin="${config_bin[$config]}"
++  local log="${outdir}/${workload}_${config}.log"
++  local json="${outdir}/${workload}_${config}.json"
+ 
+-  print "[$(date '+%H:%M:%S')] Starting ${workload} | ${config}  (log: ${log})"
++  print "[$(date '+%H:%M:%S')] Starting ${workload} | ${config}"
+   if [[ "$PARALLEL" == "1" ]]; then
+     "$bin" --warmup-instructions "$WARMUP" --simulation-instructions "$SIMULATION" \
+-      --json "$json" "$trace" > "$log" 2>&1
++      --json "$json" "$trace" > "$log" 2>&1 || print -u2 "FAILED: ${workload} | ${config} (see ${log})"
+   else
+     # 'script' keeps heartbeat lines flowing live to the terminal and the log.
+     /usr/bin/script -q /dev/null \
+@@ -63,48 +46,78 @@ run_one() {
+   print "[$(date '+%H:%M:%S')] Finished ${workload} | ${config}"
+ }
+ 
+-for trace in "${traces[@]}"; do
+-  trace_name="${trace:t}"
+-  workload="${trace_name%.champsimtrace.xz}"
++# Internal entry point used by the parallel mode (one run per invocation).
++if [[ "${1:-}" == "--one" ]]; then
++  run_one "$2" "$3" "$4" "$5"
++  exit 0
++fi
+ 
+-  for index in {1..${#config_names}}; do
+-    if [[ "$PARALLEL" == "1" ]]; then
+-      run_one "$workload" "${config_names[index]}" "${config_bins[index]}" "$trace" &
+-    else
+-      run_one "$workload" "${config_names[index]}" "${config_bins[index]}" "$trace"
+-    fi
+-  done
+-  [[ "$PARALLEL" == "1" ]] && wait
++typeset -a configs traces
++configs=(${=CONFIGS})
++traces=("${TRACE_DIR}"/*.champsimtrace.xz(N))
++
++if (( ${#traces} == 0 )); then
++  print -u2 "No .champsimtrace.xz files found in: ${TRACE_DIR}"
++  exit 1
++fi
++for config in "${configs[@]}"; do
++  if [[ -z "${config_bin[$config]:-}" ]]; then
++    print -u2 "Unknown configuration: ${config} (known: ${(k)config_bin})"
++    exit 1
++  fi
++  if [[ ! -x "${config_bin[$config]}" ]]; then
++    print -u2 "Missing executable: ${config_bin[$config]}"
++    print -u2 "Build the binaries before running this script."
++    exit 1
++  fi
+ done
++command -v jq >/dev/null || { print -u2 "jq is required to create the CSV."; exit 1; }
++
++RUN_ID="$(date '+%Y%m%d_%H%M%S')"
++OUTDIR="${CHAMPSIM_DIR}/results/dam_stage_${RUN_ID}"
++mkdir -p "$OUTDIR"
++print "Results directory: ${OUTDIR}"
++print "Configs: ${configs[*]}  Traces: ${#traces}  Warmup: ${WARMUP}  Simulation: ${SIMULATION}  Parallel: ${PARALLEL} (jobs ${JOBS})"
++
++if [[ "$PARALLEL" == "1" ]]; then
++  for trace in "${traces[@]}"; do
++    for config in "${configs[@]}"; do
++      print -r -- "$OUTDIR ${${trace:t}%.champsimtrace.xz} $config $trace"
++    done
++  done | xargs -P "$JOBS" -L 1 "$0" --one
++else
++  for trace in "${traces[@]}"; do
++    for config in "${configs[@]}"; do
++      run_one "$OUTDIR" "${${trace:t}%.champsimtrace.xz}" "$config" "$trace"
++    done
++  done
++fi
+ 
+-CSV="${OUTDIR}/stage1_comparison.csv"
+-print 'workload,configuration,instructions,cycles,ipc,llc_load_misses,llc_load_mpki,llc_rfo_misses,llc_demand_misses,llc_demand_mpki,llc_miss_latency_cycles,sram_reads,sram_writes,sttram_reads,sttram_writes,phc_sram_placements,phc_sttram_placements,phc_hot_training_events,phc_cold_training_events' > "$CSV"
++CSV="${OUTDIR}/comparison.csv"
++print 'workload,configuration,instructions,cycles,ipc,llc_load_misses,llc_load_mpki,llc_rfo_misses,llc_demand_misses,llc_demand_mpki,llc_miss_latency_cycles,sram_reads,sram_writes,sttram_reads,sttram_writes,phc_sram_placements,phc_sttram_placements,phc_hot_training_events,phc_cold_training_events,dam_dead_victims,dam_lru_victims,dam_dead_in_other_portion,dam_reuse_training,dam_dead_training,dam_phases,dam_phases_b' > "$CSV"
+ 
+ for json in "${OUTDIR}"/*.json(N); do
+-  filename="${json:t}"
+-  if [[ "$filename" == *_phc_wip.json ]]; then
+-    config="phc_wip";     workload="${filename%_phc_wip.json}"
+-  elif [[ "$filename" == *_sttram_only.json ]]; then
+-    config="sttram_only"; workload="${filename%_sttram_only.json}"
+-  elif [[ "$filename" == *_sram_only.json ]]; then
+-    config="sram_only";   workload="${filename%_sram_only.json}"
+-  else
+-    continue
+-  fi
++  filename="${json:t:r}"
++  config="" workload=""
++  for c in "${(k)config_bin[@]}"; do
++    if [[ "$filename" == *_${c} ]]; then
++      # longest matching suffix wins (e.g. sttram_only vs sram_only)
++      if [[ -z "$config" || ${#c} -gt ${#config} ]]; then config="$c"; fi
++    fi
++  done
++  [[ -z "$config" ]] && continue
++  workload="${filename%_${config}}"
+ 
+   jq -r --arg workload "$workload" --arg config "$config" '
+     .[0].roi as $roi |
+     $roi.cores[0].instructions as $instructions |
+     $roi.cores[0].cycles as $cycles |
+     $roi.LLC as $llc |
+-    ($llc["hybrid LLC"] // {}) as $hybrid |
++    ($llc["hybrid LLC"] // {}) as $h |
+     ($llc.LOAD.miss[0] // 0) as $load_misses |
+     ($llc.RFO.miss[0] // 0) as $rfo_misses |
+     [
+-      $workload,
+-      $config,
+-      $instructions,
+-      $cycles,
++      $workload, $config, $instructions, $cycles,
+       (if $cycles == 0 then 0 else $instructions / $cycles end),
+       $load_misses,
+       (if $instructions == 0 then 0 else 1000 * $load_misses / $instructions end),
+@@ -112,19 +125,17 @@ for json in "${OUTDIR}"/*.json(N); do
+       ($load_misses + $rfo_misses),
+       (if $instructions == 0 then 0 else 1000 * ($load_misses + $rfo_misses) / $instructions end),
+       ($llc["miss latency"] // 0),
+-      ($hybrid["SRAM reads"] // 0),
+-      ($hybrid["SRAM writes"] // 0),
+-      ($hybrid["STTRAM reads"] // 0),
+-      ($hybrid["STTRAM writes"] // 0),
+-      ($hybrid["PHC SRAM placements"] // 0),
+-      ($hybrid["PHC STTRAM placements"] // 0),
+-      ($hybrid["PHC hot training events"] // 0),
+-      ($hybrid["PHC cold training events"] // 0)
++      ($h["SRAM reads"] // 0), ($h["SRAM writes"] // 0), ($h["STTRAM reads"] // 0), ($h["STTRAM writes"] // 0),
++      ($h["PHC SRAM placements"] // 0), ($h["PHC STTRAM placements"] // 0),
++      ($h["PHC hot training events"] // 0), ($h["PHC cold training events"] // 0),
++      ($h["DAM dead victims"] // 0), ($h["DAM LRU victims"] // 0), ($h["DAM dead in other portion"] // 0),
++      ($h["DAM reuse training"] // 0), ($h["DAM dead training"] // 0),
++      ($h["DAM dueling phases"] // 0), ($h["DAM dueling phases threshold B"] // 0)
+     ] | @csv
+   ' "$json" >> "$CSV"
+ done
+ 
+ print ""
+-print "All $(( ${#traces} * ${#config_names} )) runs completed."
++print "Done: ${#traces} traces x ${#configs} configs."
+ print "Results directory: ${OUTDIR}"
+ print "Comparison CSV: ${CSV}"
+diff --git a/src/cache.cc b/src/cache.cc
+index 848f985..4dd7a1d 100644
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -49,7 +49,7 @@ CACHE::CACHE(CACHE&& other)
+       sram_read_ports(std::move(other.sram_read_ports)), sram_write_ports(std::move(other.sram_write_ports)),
+       sttram_read_ports(std::move(other.sttram_read_ports)), sttram_write_ports(std::move(other.sttram_write_ports)),
+       pref_activate_mask(std::move(other.pref_activate_mask)), phc_predictor(std::move(other.phc_predictor)),
+-      phc_sampler(std::move(other.phc_sampler)), phc_sampler_clock(other.phc_sampler_clock),
++      phc_sampler(std::move(other.phc_sampler)), phc_sampler_clock(other.phc_sampler_clock), dam(std::move(other.dam)),
+ 
+       sim_stats(std::move(other.sim_stats)), roi_stats(std::move(other.roi_stats)),
+ 
+@@ -107,6 +107,7 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
+   this->phc_predictor = std::move(other.phc_predictor);
+   this->phc_sampler = std::move(other.phc_sampler);
+   this->phc_sampler_clock = other.phc_sampler_clock;
++  this->dam = std::move(other.dam);
+   this->delayed_responses = std::move(other.delayed_responses);
+ 
+   this->sim_stats = std::move(other.sim_stats);
+@@ -226,6 +227,9 @@ bool CACHE::handle_fill(const fill_type& fill)
+                fill.data_promise->pf_metadata, (fill.time_enqueued.time_since_epoch()) / clock_period, (current_time.time_since_epoch()) / clock_period);
+   }
+ 
++  if (dam.enabled && way != set_end && way->valid)
++    dam_note_eviction(get_set_index(fill.address), way_idx);
++
+   if (way != set_end && way->valid && way->dirty) {
+     request_type writeback_packet;
+ 
+@@ -268,6 +272,13 @@ bool CACHE::handle_fill(const fill_type& fill)
+     }
+ 
+     *way = fill_block(fill, metadata_thru);
++    if (dam.enabled) {
++      // DAM: remember the (hashed) PC of the instruction that brought the block in.
++      const auto idx = static_cast<std::size_t>(get_set_index(fill.address) * NUM_WAY + way_idx);
++      const bool has_pc = (fill.ip != champsim::address{}) && (fill.type != access_type::WRITE);
++      dam.block_pc.at(idx) = has_pc ? dam_hash_pc(fill.ip) : uint8_t{0};
++      dam.block_has_pc.at(idx) = has_pc ? 1 : 0;
++    }
+     if (hybrid_llc)
+       count_medium_access(is_sram_way(way_idx), true);
+   }
+@@ -427,6 +438,8 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
+   }
+ 
+   phc_sampler_access(handle_pkt);
++  if (dam.enabled && handle_pkt.type != access_type::PREFETCH)
++    dam_record_demand_miss(get_set_index(handle_pkt.address));
+   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
+ 
+   return true;
+@@ -716,6 +729,12 @@ void CACHE::phc_sampler_access(const tag_lookup_type& request)
+     if (entry == end) {
+       entry = std::min_element(begin, end, [](const auto& lhs, const auto& rhs) { return lhs.last_used < rhs.last_used; });
+       phc_train(entry->trigger_index, entry->cost);
++      if (dam.enabled) {
++        // DAM: a block leaving the (LRU) sampler lowers its PC's reuse state.
++        auto& state = dam.rst.at(entry->dam_pc);
++        state = (state == 0) ? uint8_t{0} : static_cast<uint8_t>(state - 1);
++        ++sim_stats.dam_dead_training;
++      }
+     }
+ 
+     // Fix 3: PHC Fig. 3 -- the access that brings a block in starts its cost
+@@ -724,15 +743,110 @@ void CACHE::phc_sampler_access(const tag_lookup_type& request)
+     entry->partial_tag = partial_tag;
+     entry->trigger_index = static_cast<uint16_t>(request.ip.to<uint64_t>() & 0xfffULL);
+     entry->cost = 0;
++    entry->dam_pc = dam_hash_pc(request.ip);
+     entry->last_used = phc_sampler_clock++;
+     return;
+   }
+ 
++  if (dam.enabled && request.type != access_type::WRITE) {
++    // DAM: a demand hit to a sampled block raises its PC's reuse state.
++    auto& state = dam.rst.at(entry->dam_pc);
++    state = (state == 255) ? uint8_t{255} : static_cast<uint8_t>(state + 1);
++    ++sim_stats.dam_reuse_training;
++  }
++
+   const auto updated_cost = static_cast<int32_t>(entry->cost) + access_delta;
+   entry->cost = static_cast<int16_t>(std::clamp(updated_cost, -128, 127));
+   entry->last_used = phc_sampler_clock++;
+ }
+ 
++uint8_t CACHE::dam_hash_pc(champsim::address ip)
++{
++  // 8-bit XOR fold of the full PC.
++  auto pc = ip.to<uint64_t>();
++  uint64_t hash = 0;
++  for (int i = 0; i < 8; ++i) {
++    hash ^= pc & 0xffULL;
++    pc >>= 8;
++  }
++  return static_cast<uint8_t>(hash);
++}
++
++int CACHE::dam_leader(long set) const
++{
++  // 32 leader sets per group: one A leader and one B leader in every block of NUM_SET/32 sets.
++  // Offsets 1 and stride/2+1 avoid the PHC sampler sets (set % 32 == 0).
++  const long stride = static_cast<long>(NUM_SET) / 32;
++  const long offset = set % stride;
++  if (offset == 1)
++    return 1;
++  if (offset == stride / 2 + 1)
++    return 2;
++  return 0;
++}
++
++uint32_t CACHE::dam_threshold_for_set(long set) const
++{
++  switch (dam_leader(set)) {
++  case 1:
++    return dam.threshold_a;
++  case 2:
++    return dam.threshold_b;
++  default:
++    return dam.followers_use_b ? dam.threshold_b : dam.threshold_a;
++  }
++}
++
++bool CACHE::dam_block_dead(long set, long way) const
++{
++  if (!dam.enabled)
++    return false;
++  const auto idx = static_cast<std::size_t>(set * NUM_WAY + way);
++  if (!block.at(idx).valid || dam.block_has_pc.at(idx) == 0)
++    return false;
++  return dam.rst.at(dam.block_pc.at(idx)) < dam_threshold_for_set(set);
++}
++
++void CACHE::dam_record_demand_miss(long set)
++{
++  switch (dam_leader(set)) {
++  case 1:
++    ++dam.leader_misses_a;
++    break;
++  case 2:
++    ++dam.leader_misses_b;
++    break;
++  default:
++    break;
++  }
++  if (++dam.phase_misses >= dam.phase_length) {
++    // The leader group with fewer misses sets the followers' threshold for the next phase (ties keep the current choice).
++    if (dam.leader_misses_a != dam.leader_misses_b)
++      dam.followers_use_b = dam.leader_misses_b < dam.leader_misses_a;
++    ++sim_stats.dam_phases;
++    if (dam.followers_use_b)
++      ++sim_stats.dam_phases_b;
++    dam.leader_misses_a = dam.leader_misses_b = dam.phase_misses = 0;
++  }
++}
++
++void CACHE::dam_note_eviction(long set, long way)
++{
++  if (dam_block_dead(set, way)) {
++    ++sim_stats.dam_dead_victims;
++    return;
++  }
++  ++sim_stats.dam_lru_victims;
++  // Stage 3 opportunity: was a dead block available in the other technology portion?
++  const auto [first, last] = hybrid_way_range(!is_sram_way(way));
++  for (long w = first; w < last; ++w) {
++    if (dam_block_dead(set, w)) {
++      ++sim_stats.dam_dead_in_other_portion;
++      break;
++    }
++  }
++}
++
+ champsim::chrono::clock::duration CACHE::medium_latency(bool sram, bool write) const
+ {
+   if (sram)
+@@ -1123,6 +1237,13 @@ void CACHE::end_phase(unsigned finished_cpu)
+   roi_stats.phc_sttram_placements = sim_stats.phc_sttram_placements;
+   roi_stats.phc_hot_training_events = sim_stats.phc_hot_training_events;
+   roi_stats.phc_cold_training_events = sim_stats.phc_cold_training_events;
++  roi_stats.dam_dead_victims = sim_stats.dam_dead_victims;
++  roi_stats.dam_lru_victims = sim_stats.dam_lru_victims;
++  roi_stats.dam_dead_in_other_portion = sim_stats.dam_dead_in_other_portion;
++  roi_stats.dam_reuse_training = sim_stats.dam_reuse_training;
++  roi_stats.dam_dead_training = sim_stats.dam_dead_training;
++  roi_stats.dam_phases = sim_stats.dam_phases;
++  roi_stats.dam_phases_b = sim_stats.dam_phases_b;
+ 
+   for (auto* ul : upper_levels) {
+     ul->roi_stats.RQ_ACCESS = ul->sim_stats.RQ_ACCESS;
+diff --git a/src/cache_stats.cc b/src/cache_stats.cc
+index 273341a..91efc22 100644
+--- a/src/cache_stats.cc
++++ b/src/cache_stats.cc
+@@ -16,6 +16,13 @@ cache_stats operator-(cache_stats lhs, cache_stats rhs)
+   result.phc_sttram_placements = lhs.phc_sttram_placements - rhs.phc_sttram_placements;
+   result.phc_hot_training_events = lhs.phc_hot_training_events - rhs.phc_hot_training_events;
+   result.phc_cold_training_events = lhs.phc_cold_training_events - rhs.phc_cold_training_events;
++  result.dam_dead_victims = lhs.dam_dead_victims - rhs.dam_dead_victims;
++  result.dam_lru_victims = lhs.dam_lru_victims - rhs.dam_lru_victims;
++  result.dam_dead_in_other_portion = lhs.dam_dead_in_other_portion - rhs.dam_dead_in_other_portion;
++  result.dam_reuse_training = lhs.dam_reuse_training - rhs.dam_reuse_training;
++  result.dam_dead_training = lhs.dam_dead_training - rhs.dam_dead_training;
++  result.dam_phases = lhs.dam_phases - rhs.dam_phases;
++  result.dam_phases_b = lhs.dam_phases_b - rhs.dam_phases_b;
+ 
+   result.hits = lhs.hits - rhs.hits;
+   result.misses = lhs.misses - rhs.misses;
+diff --git a/src/json_printer.cc b/src/json_printer.cc
+index 681cb6a..e3eab73 100644
+--- a/src/json_printer.cc
++++ b/src/json_printer.cc
+@@ -56,7 +56,14 @@ void to_json(nlohmann::json& j, const CACHE::stats_type& stats)
+                                                   {"PHC SRAM placements", stats.phc_sram_placements},
+                                                   {"PHC STTRAM placements", stats.phc_sttram_placements},
+                                                   {"PHC hot training events", stats.phc_hot_training_events},
+-                                                  {"PHC cold training events", stats.phc_cold_training_events}});
++                                                  {"PHC cold training events", stats.phc_cold_training_events},
++                                                  {"DAM dead victims", stats.dam_dead_victims},
++                                                  {"DAM LRU victims", stats.dam_lru_victims},
++                                                  {"DAM dead in other portion", stats.dam_dead_in_other_portion},
++                                                  {"DAM reuse training", stats.dam_reuse_training},
++                                                  {"DAM dead training", stats.dam_dead_training},
++                                                  {"DAM dueling phases", stats.dam_phases},
++                                                  {"DAM dueling phases threshold B", stats.dam_phases_b}});
+ 
+   uint64_t total_downstream_demands = stats.fill.total();
+   for (std::size_t cpu = 0; cpu < NUM_CPUS; ++cpu)
+diff --git a/src/plain_printer.cc b/src/plain_printer.cc
+index e9e1a23..e0bd728 100644
+--- a/src/plain_printer.cc
++++ b/src/plain_printer.cc
+@@ -130,6 +130,13 @@ std::vector<std::string> champsim::plain_printer::format(CACHE::stats_type stats
+                                   stats.phc_cold_training_events));
+     }
+ 
++    if (stats.dam_dead_victims != 0 || stats.dam_lru_victims != 0) {
++      lines.push_back(fmt::format("cpu{}->{} DAM DVS DEAD VICTIMS: {:10} LRU VICTIMS: {:10} (DEAD ONLY IN OTHER PORTION: {:10})", cpu, stats.name,
++                                  stats.dam_dead_victims, stats.dam_lru_victims, stats.dam_dead_in_other_portion));
++      lines.push_back(fmt::format("cpu{}->{} DAM DP TRAINING REUSE: {:10} DEAD: {:10} DUELING PHASES: {:10} (THRESHOLD B: {:10})", cpu, stats.name,
++                                  stats.dam_reuse_training, stats.dam_dead_training, stats.dam_phases, stats.dam_phases_b));
++    }
++
+     uint64_t total_downstream_demands = total_fill - stats.fill.value_or(std::pair{access_type::PREFETCH, cpu}, fill_value_type{});
+     lines.push_back(
+         fmt::format("cpu{}->{} AVERAGE MISS LATENCY: {} cycles", cpu, stats.name, ::print_ratio(stats.total_miss_latency_cycles, total_downstream_demands)));

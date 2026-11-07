@@ -16,6 +16,13 @@ cache_stats operator-(cache_stats lhs, cache_stats rhs)
   result.phc_sttram_placements = lhs.phc_sttram_placements - rhs.phc_sttram_placements;
   result.phc_hot_training_events = lhs.phc_hot_training_events - rhs.phc_hot_training_events;
   result.phc_cold_training_events = lhs.phc_cold_training_events - rhs.phc_cold_training_events;
+  result.dam_dead_victims = lhs.dam_dead_victims - rhs.dam_dead_victims;
+  result.dam_lru_victims = lhs.dam_lru_victims - rhs.dam_lru_victims;
+  result.dam_dead_in_other_portion = lhs.dam_dead_in_other_portion - rhs.dam_dead_in_other_portion;
+  result.dam_reuse_training = lhs.dam_reuse_training - rhs.dam_reuse_training;
+  result.dam_dead_training = lhs.dam_dead_training - rhs.dam_dead_training;
+  result.dam_phases = lhs.dam_phases - rhs.dam_phases;
+  result.dam_phases_b = lhs.dam_phases_b - rhs.dam_phases_b;
 
   result.hits = lhs.hits - rhs.hits;
   result.misses = lhs.misses - rhs.misses;

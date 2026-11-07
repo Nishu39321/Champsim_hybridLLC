@@ -56,7 +56,14 @@ void to_json(nlohmann::json& j, const CACHE::stats_type& stats)
                                                   {"PHC SRAM placements", stats.phc_sram_placements},
                                                   {"PHC STTRAM placements", stats.phc_sttram_placements},
                                                   {"PHC hot training events", stats.phc_hot_training_events},
-                                                  {"PHC cold training events", stats.phc_cold_training_events}});
+                                                  {"PHC cold training events", stats.phc_cold_training_events},
+                                                  {"DAM dead victims", stats.dam_dead_victims},
+                                                  {"DAM LRU victims", stats.dam_lru_victims},
+                                                  {"DAM dead in other portion", stats.dam_dead_in_other_portion},
+                                                  {"DAM reuse training", stats.dam_reuse_training},
+                                                  {"DAM dead training", stats.dam_dead_training},
+                                                  {"DAM dueling phases", stats.dam_phases},
+                                                  {"DAM dueling phases threshold B", stats.dam_phases_b}});
 
   uint64_t total_downstream_demands = stats.fill.total();
   for (std::size_t cpu = 0; cpu < NUM_CPUS; ++cpu)

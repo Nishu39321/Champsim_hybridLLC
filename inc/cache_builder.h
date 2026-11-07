@@ -75,6 +75,11 @@ struct cache_builder_base {
   int32_t m_phc_read_delta{-1};
   int32_t m_phc_write_delta{24};
   uint32_t m_phc_sampler_period{32};
+  bool m_dam_dvs{};
+  uint32_t m_dam_rst_init{128};
+  uint32_t m_dam_threshold_a{64};
+  uint32_t m_dam_threshold_b{128};
+  uint32_t m_dam_dueling_phase{4096};
 
   std::vector<access_type> m_pref_act_mask{access_type::LOAD, access_type::PREFETCH};
   std::vector<champsim::channel*> m_uls{};
@@ -256,6 +261,13 @@ public:
   self_type& phc_read_delta(int32_t delta_);
   self_type& phc_write_delta(int32_t delta_);
   self_type& phc_sampler_period(uint32_t period_);
+
+  /** Enable DAM's PC-based dead-block predictor and dead-block victim selection (DVS). */
+  self_type& set_dam_dvs();
+  self_type& dam_rst_init(uint32_t value_);
+  self_type& dam_threshold_a(uint32_t value_);
+  self_type& dam_threshold_b(uint32_t value_);
+  self_type& dam_dueling_phase(uint32_t value_);
 
   /**
    * Specify the ``access_type`` values that should activate the prefetcher.
@@ -641,6 +653,42 @@ template <typename P, typename R>
 auto champsim::cache_builder<P, R>::phc_sampler_period(uint32_t period_) -> self_type&
 {
   m_phc_sampler_period = period_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::set_dam_dvs() -> self_type&
+{
+  m_hybrid_llc = true;
+  m_dam_dvs = true;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::dam_rst_init(uint32_t value_) -> self_type&
+{
+  m_dam_rst_init = value_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::dam_threshold_a(uint32_t value_) -> self_type&
+{
+  m_dam_threshold_a = value_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::dam_threshold_b(uint32_t value_) -> self_type&
+{
+  m_dam_threshold_b = value_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::dam_dueling_phase(uint32_t value_) -> self_type&
+{
+  m_dam_dueling_phase = value_;
   return *this;
 }
 

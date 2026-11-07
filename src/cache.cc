@@ -49,7 +49,7 @@ CACHE::CACHE(CACHE&& other)
       sram_read_ports(std::move(other.sram_read_ports)), sram_write_ports(std::move(other.sram_write_ports)),
       sttram_read_ports(std::move(other.sttram_read_ports)), sttram_write_ports(std::move(other.sttram_write_ports)),
       pref_activate_mask(std::move(other.pref_activate_mask)), phc_predictor(std::move(other.phc_predictor)),
-      phc_sampler(std::move(other.phc_sampler)), phc_sampler_clock(other.phc_sampler_clock),
+      phc_sampler(std::move(other.phc_sampler)), phc_sampler_clock(other.phc_sampler_clock), dam(std::move(other.dam)),
 
       sim_stats(std::move(other.sim_stats)), roi_stats(std::move(other.roi_stats)),
 
@@ -107,6 +107,7 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
   this->phc_predictor = std::move(other.phc_predictor);
   this->phc_sampler = std::move(other.phc_sampler);
   this->phc_sampler_clock = other.phc_sampler_clock;
+  this->dam = std::move(other.dam);
   this->delayed_responses = std::move(other.delayed_responses);
 
   this->sim_stats = std::move(other.sim_stats);
@@ -226,6 +227,9 @@ bool CACHE::handle_fill(const fill_type& fill)
                fill.data_promise->pf_metadata, (fill.time_enqueued.time_since_epoch()) / clock_period, (current_time.time_since_epoch()) / clock_period);
   }
 
+  if (dam.enabled && way != set_end && way->valid)
+    dam_note_eviction(get_set_index(fill.address), way_idx);
+
   if (way != set_end && way->valid && way->dirty) {
     request_type writeback_packet;
 
@@ -268,6 +272,13 @@ bool CACHE::handle_fill(const fill_type& fill)
     }
 
     *way = fill_block(fill, metadata_thru);
+    if (dam.enabled) {
+      // DAM: remember the (hashed) PC of the instruction that brought the block in.
+      const auto idx = static_cast<std::size_t>(get_set_index(fill.address) * NUM_WAY + way_idx);
+      const bool has_pc = (fill.ip != champsim::address{}) && (fill.type != access_type::WRITE);
+      dam.block_pc.at(idx) = has_pc ? dam_hash_pc(fill.ip) : uint8_t{0};
+      dam.block_has_pc.at(idx) = has_pc ? 1 : 0;
+    }
     if (hybrid_llc)
       count_medium_access(is_sram_way(way_idx), true);
   }
@@ -427,6 +438,8 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
   }
 
   phc_sampler_access(handle_pkt);
+  if (dam.enabled && handle_pkt.type != access_type::PREFETCH)
+    dam_record_demand_miss(get_set_index(handle_pkt.address));
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
   return true;
@@ -716,6 +729,12 @@ void CACHE::phc_sampler_access(const tag_lookup_type& request)
     if (entry == end) {
       entry = std::min_element(begin, end, [](const auto& lhs, const auto& rhs) { return lhs.last_used < rhs.last_used; });
       phc_train(entry->trigger_index, entry->cost);
+      if (dam.enabled) {
+        // DAM: a block leaving the (LRU) sampler lowers its PC's reuse state.
+        auto& state = dam.rst.at(entry->dam_pc);
+        state = (state == 0) ? uint8_t{0} : static_cast<uint8_t>(state - 1);
+        ++sim_stats.dam_dead_training;
+      }
     }
 
     // Fix 3: PHC Fig. 3 -- the access that brings a block in starts its cost
@@ -724,13 +743,108 @@ void CACHE::phc_sampler_access(const tag_lookup_type& request)
     entry->partial_tag = partial_tag;
     entry->trigger_index = static_cast<uint16_t>(request.ip.to<uint64_t>() & 0xfffULL);
     entry->cost = 0;
+    entry->dam_pc = dam_hash_pc(request.ip);
     entry->last_used = phc_sampler_clock++;
     return;
+  }
+
+  if (dam.enabled && request.type != access_type::WRITE) {
+    // DAM: a demand hit to a sampled block raises its PC's reuse state.
+    auto& state = dam.rst.at(entry->dam_pc);
+    state = (state == 255) ? uint8_t{255} : static_cast<uint8_t>(state + 1);
+    ++sim_stats.dam_reuse_training;
   }
 
   const auto updated_cost = static_cast<int32_t>(entry->cost) + access_delta;
   entry->cost = static_cast<int16_t>(std::clamp(updated_cost, -128, 127));
   entry->last_used = phc_sampler_clock++;
+}
+
+uint8_t CACHE::dam_hash_pc(champsim::address ip)
+{
+  // 8-bit XOR fold of the full PC.
+  auto pc = ip.to<uint64_t>();
+  uint64_t hash = 0;
+  for (int i = 0; i < 8; ++i) {
+    hash ^= pc & 0xffULL;
+    pc >>= 8;
+  }
+  return static_cast<uint8_t>(hash);
+}
+
+int CACHE::dam_leader(long set) const
+{
+  // 32 leader sets per group: one A leader and one B leader in every block of NUM_SET/32 sets.
+  // Offsets 1 and stride/2+1 avoid the PHC sampler sets (set % 32 == 0).
+  const long stride = static_cast<long>(NUM_SET) / 32;
+  const long offset = set % stride;
+  if (offset == 1)
+    return 1;
+  if (offset == stride / 2 + 1)
+    return 2;
+  return 0;
+}
+
+uint32_t CACHE::dam_threshold_for_set(long set) const
+{
+  switch (dam_leader(set)) {
+  case 1:
+    return dam.threshold_a;
+  case 2:
+    return dam.threshold_b;
+  default:
+    return dam.followers_use_b ? dam.threshold_b : dam.threshold_a;
+  }
+}
+
+bool CACHE::dam_block_dead(long set, long way) const
+{
+  if (!dam.enabled)
+    return false;
+  const auto idx = static_cast<std::size_t>(set * NUM_WAY + way);
+  if (!block.at(idx).valid || dam.block_has_pc.at(idx) == 0)
+    return false;
+  return dam.rst.at(dam.block_pc.at(idx)) < dam_threshold_for_set(set);
+}
+
+void CACHE::dam_record_demand_miss(long set)
+{
+  switch (dam_leader(set)) {
+  case 1:
+    ++dam.leader_misses_a;
+    break;
+  case 2:
+    ++dam.leader_misses_b;
+    break;
+  default:
+    break;
+  }
+  if (++dam.phase_misses >= dam.phase_length) {
+    // The leader group with fewer misses sets the followers' threshold for the next phase (ties keep the current choice).
+    if (dam.leader_misses_a != dam.leader_misses_b)
+      dam.followers_use_b = dam.leader_misses_b < dam.leader_misses_a;
+    ++sim_stats.dam_phases;
+    if (dam.followers_use_b)
+      ++sim_stats.dam_phases_b;
+    dam.leader_misses_a = dam.leader_misses_b = dam.phase_misses = 0;
+  }
+}
+
+void CACHE::dam_note_eviction(long set, long way)
+{
+  if (dam_block_dead(set, way)) {
+    ++sim_stats.dam_dead_victims;
+    return;
+  }
+  ++sim_stats.dam_lru_victims;
+  // Stage 3 opportunity: was a dead block available in the other technology portion?
+  const auto [first, last] = hybrid_way_range(!is_sram_way(way));
+  for (long w = first; w < last; ++w) {
+    if (dam_block_dead(set, w)) {
+      ++sim_stats.dam_dead_in_other_portion;
+      break;
+    }
+  }
 }
 
 champsim::chrono::clock::duration CACHE::medium_latency(bool sram, bool write) const
@@ -1123,6 +1237,13 @@ void CACHE::end_phase(unsigned finished_cpu)
   roi_stats.phc_sttram_placements = sim_stats.phc_sttram_placements;
   roi_stats.phc_hot_training_events = sim_stats.phc_hot_training_events;
   roi_stats.phc_cold_training_events = sim_stats.phc_cold_training_events;
+  roi_stats.dam_dead_victims = sim_stats.dam_dead_victims;
+  roi_stats.dam_lru_victims = sim_stats.dam_lru_victims;
+  roi_stats.dam_dead_in_other_portion = sim_stats.dam_dead_in_other_portion;
+  roi_stats.dam_reuse_training = sim_stats.dam_reuse_training;
+  roi_stats.dam_dead_training = sim_stats.dam_dead_training;
+  roi_stats.dam_phases = sim_stats.dam_phases;
+  roi_stats.dam_phases_b = sim_stats.dam_phases_b;
 
   for (auto* ul : upper_levels) {
     ul->roi_stats.RQ_ACCESS = ul->sim_stats.RQ_ACCESS;

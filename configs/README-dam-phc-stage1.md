@@ -60,3 +60,27 @@ for c in sram_only sttram_only phc_wip; do
   ./config.sh configs/dam_$c.json && make -j8 || break
 done
 ```
+
+## Stage 2: DAM dead-block predictor + DVS (`dam_dvs.json`)
+
+Placement is unchanged from Stage 1 (PHC's 4,096-entry write-intensity table).
+Stage 2 changes only victim selection:
+
+* **Dead-block predictor (DAM Sec. 3).** A 256-entry, 8-bit reuse-state table
+  (RST) indexed by an 8-bit XOR hash of the PC. Every LLC block stores the
+  hashed PC of the instruction that brought it in (writeback fills have no PC
+  and are never predicted dead). The RST is trained by the shared 1/32-set
+  sampler: a demand hit to a sampled block increments its PC's entry, and a
+  block evicted from the sampler decrements it. A block is predicted dead
+  when `RST[pc] < threshold`.
+* **Set-dueling threshold.** 32 leader sets use `dam_threshold_a` (64) and 32
+  use `dam_threshold_b` (128); every `dam_dueling_phase` (4,096) demand misses
+  the group with fewer misses sets the threshold for all other sets.
+* **DVS.** On a fill, an invalid way in the chosen portion is used first; then
+  the least recently used predicted-dead block in that portion; otherwise
+  plain LRU in that portion. No migration yet (Stage 3).
+
+New statistics: `DAM dead victims`, `DAM LRU victims`, `DAM dead in other
+portion` (LRU evictions where a dead block existed in the *other* portion:
+the opportunity Stage 3's migration targets), RST training counts and the
+number of set-dueling phases won by threshold B.

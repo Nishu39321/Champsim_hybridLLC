@@ -130,6 +130,13 @@ std::vector<std::string> champsim::plain_printer::format(CACHE::stats_type stats
                                   stats.phc_cold_training_events));
     }
 
+    if (stats.dam_dead_victims != 0 || stats.dam_lru_victims != 0) {
+      lines.push_back(fmt::format("cpu{}->{} DAM DVS DEAD VICTIMS: {:10} LRU VICTIMS: {:10} (DEAD ONLY IN OTHER PORTION: {:10})", cpu, stats.name,
+                                  stats.dam_dead_victims, stats.dam_lru_victims, stats.dam_dead_in_other_portion));
+      lines.push_back(fmt::format("cpu{}->{} DAM DP TRAINING REUSE: {:10} DEAD: {:10} DUELING PHASES: {:10} (THRESHOLD B: {:10})", cpu, stats.name,
+                                  stats.dam_reuse_training, stats.dam_dead_training, stats.dam_phases, stats.dam_phases_b));
+    }
+
     uint64_t total_downstream_demands = total_fill - stats.fill.value_or(std::pair{access_type::PREFETCH, cpu}, fill_value_type{});
     lines.push_back(
         fmt::format("cpu{}->{} AVERAGE MISS LATENCY: {} cycles", cpu, stats.name, ::print_ratio(stats.total_miss_latency_cycles, total_downstream_demands)));
