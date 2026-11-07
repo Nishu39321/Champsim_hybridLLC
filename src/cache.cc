@@ -414,7 +414,17 @@ bool CACHE::handle_write(const tag_lookup_type& handle_pkt)
   }
 
   fill_type to_allocate{handle_pkt, current_time};
-  to_allocate.data_promise.ready_at(current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY));
+  if (hybrid_llc && !warmup) {
+    // A writeback miss allocates a line directly in this cache, so it does not
+    // pass through finish_packet(). Account for the destination medium's write
+    // latency and its write-port contention here instead.
+    const auto sram = target_is_sram(handle_pkt.type);
+    const auto latency = medium_latency(sram, true);
+    const auto start = reserve_medium_port(sram, true, latency);
+    to_allocate.data_promise.ready_at(start + latency);
+  } else {
+    to_allocate.data_promise.ready_at(current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY));
+  }
   inflight_fills.push_back(to_allocate);
 
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
