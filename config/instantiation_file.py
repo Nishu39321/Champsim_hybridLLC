@@ -110,7 +110,10 @@ cache_builder_parts = {
     'dam_rst_init': '.dam_rst_init({dam_rst_init})',
     'dam_threshold_a': '.dam_threshold_a({dam_threshold_a})',
     'dam_threshold_b': '.dam_threshold_b({dam_threshold_b})',
-    'dam_dueling_phase': '.dam_dueling_phase({dam_dueling_phase})'
+    'dam_dueling_phase': '.dam_dueling_phase({dam_dueling_phase})',
+    'dam_writeback_reuse': '.set_dam_writeback_reuse()',
+    'dam_nopc_dead': '.set_dam_nopc_dead()',
+    'dam_dm': '.set_dam_dm()'
 }
 
 ptw_builder_parts = {

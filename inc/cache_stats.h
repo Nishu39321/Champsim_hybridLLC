@@ -34,6 +34,9 @@ struct cache_stats {
   uint64_t dam_dead_training = 0;        // reuse-state table decrements (sampler evictions)
   uint64_t dam_phases = 0;               // set-dueling phases completed
   uint64_t dam_phases_b = 0;             // phases after which followers used threshold B
+  // DAM dead-block-based migration (Stage 3)
+  uint64_t dam_migrations_to_sram = 0;   // STT-RAM block moved into a dead SRAM slot (incoming block -> STT-RAM)
+  uint64_t dam_migrations_to_sttram = 0; // SRAM block moved into a dead STT-RAM slot (incoming block -> SRAM)
 
   champsim::stats::event_counter<std::pair<access_type, std::remove_cv_t<decltype(NUM_CPUS)>>> hits = {};
   champsim::stats::event_counter<std::pair<access_type, std::remove_cv_t<decltype(NUM_CPUS)>>> misses = {};

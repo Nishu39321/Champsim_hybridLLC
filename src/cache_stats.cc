@@ -23,6 +23,8 @@ cache_stats operator-(cache_stats lhs, cache_stats rhs)
   result.dam_dead_training = lhs.dam_dead_training - rhs.dam_dead_training;
   result.dam_phases = lhs.dam_phases - rhs.dam_phases;
   result.dam_phases_b = lhs.dam_phases_b - rhs.dam_phases_b;
+  result.dam_migrations_to_sram = lhs.dam_migrations_to_sram - rhs.dam_migrations_to_sram;
+  result.dam_migrations_to_sttram = lhs.dam_migrations_to_sttram - rhs.dam_migrations_to_sttram;
 
   result.hits = lhs.hits - rhs.hits;
   result.misses = lhs.misses - rhs.misses;

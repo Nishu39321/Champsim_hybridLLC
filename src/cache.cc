@@ -212,6 +212,7 @@ bool CACHE::handle_fill(const fill_type& fill)
   auto medium_begin = std::next(set_begin, medium_begin_idx);
   auto medium_end = std::next(set_begin, medium_end_idx);
   auto way = std::find_if_not(medium_begin, medium_end, [](auto x) { return x.valid; });
+  dam.pending.valid = false;
   if (way == medium_end) {
     way = std::next(set_begin,
                     impl_find_victim(fill.cpu, fill.instr_id, get_set_index(fill.address), &*set_begin, fill.ip, fill.address, fill.type, fill.target_sram));
@@ -225,6 +226,56 @@ bool CACHE::handle_fill(const fill_type& fill)
     fmt::print("[{}] {} instr_id: {} address: {} v_address: {} set: {} way: {} type: {} prefetch_metadata: {} cycle_enqueued: {} cycle: {}\n", NAME, __func__,
                fill.instr_id, fill.address, fill.v_address, get_set_index(fill.address), way_idx, access_type_names.at(champsim::to_underlying(fill.type)),
                fill.data_promise->pf_metadata, (fill.time_enqueued.time_since_epoch()) / clock_period, (current_time.time_since_epoch()) / clock_period);
+  }
+
+  // Stage 3 (DM): the replacement policy found no dead block in the target
+  // portion but one in the other portion. Evict that dead block, move the
+  // chosen block of the target portion into its slot, and fill the incoming
+  // block into the freed way.
+  if (dam.dm && dam.pending.valid && dam.pending.set == get_set_index(fill.address) && dam.pending.from == way_idx) {
+    const long set_idx = dam.pending.set;
+    auto dead = std::next(set_begin, dam.pending.to);
+    if (dead->valid && dead->dirty) {
+      request_type writeback_packet;
+      writeback_packet.cpu = fill.cpu;
+      writeback_packet.address = dead->address;
+      writeback_packet.data = dead->data;
+      writeback_packet.instr_id = fill.instr_id;
+      writeback_packet.ip = champsim::address{};
+      writeback_packet.type = access_type::WRITE;
+      writeback_packet.pf_metadata = dead->pf_metadata;
+      writeback_packet.response_requested = false;
+      if (!lower_level->add_wq(writeback_packet))
+        return false; // retried next cycle; no state has changed
+    }
+    if (dead->valid && dead->prefetch)
+      ++sim_stats.pf_useless;
+    ++sim_stats.dam_dead_victims;
+
+    // Move the block and its predictor metadata (replacement state is moved by hybrid_lru).
+    const auto from_idx = static_cast<std::size_t>(set_idx * NUM_WAY + dam.pending.from);
+    const auto to_idx = static_cast<std::size_t>(set_idx * NUM_WAY + dam.pending.to);
+    *dead = *way;
+    dam.block_pc.at(to_idx) = dam.block_pc.at(from_idx);
+    dam.block_has_pc.at(to_idx) = dam.block_has_pc.at(from_idx);
+    dam.block_cost.at(to_idx) = dam.block_cost.at(from_idx);
+    way->valid = false; // the incoming block now fills an empty way
+
+    // Migration traffic: read from the source medium, write into the destination medium.
+    const bool src_sram = is_sram_way(dam.pending.from);
+    const bool dst_sram = is_sram_way(dam.pending.to);
+    if (dst_sram)
+      ++sim_stats.dam_migrations_to_sram;
+    else
+      ++sim_stats.dam_migrations_to_sttram;
+    if (hybrid_llc) {
+      if (!warmup) {
+        reserve_medium_port(src_sram, false, medium_latency(src_sram, false));
+        reserve_medium_port(dst_sram, true, medium_latency(dst_sram, true));
+      }
+      count_medium_access(src_sram, false);
+      count_medium_access(dst_sram, true);
+    }
   }
 
   if (dam.enabled && way != set_end && way->valid)
@@ -278,6 +329,8 @@ bool CACHE::handle_fill(const fill_type& fill)
       const bool has_pc = (fill.ip != champsim::address{}) && (fill.type != access_type::WRITE);
       dam.block_pc.at(idx) = has_pc ? dam_hash_pc(fill.ip) : uint8_t{0};
       dam.block_has_pc.at(idx) = has_pc ? 1 : 0;
+      if (dam.dm)
+        dam.block_cost.at(idx) = 0;
     }
     if (hybrid_llc)
       count_medium_access(is_sram_way(way_idx), true);
@@ -346,6 +399,13 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
     }
 
     way->dirty |= (handle_pkt.type == access_type::WRITE);
+
+    if (dam.dm) {
+      // Stage 3: per-block write-intensity cost (same deltas as PHC: +24 per write, -1 per read).
+      auto& cost = dam.block_cost.at(static_cast<std::size_t>(get_set_index(handle_pkt.address) * NUM_WAY + way_idx));
+      const auto delta = (handle_pkt.type == access_type::WRITE) ? PHC_WRITE_DELTA : PHC_READ_DELTA;
+      cost = static_cast<int8_t>(std::clamp(static_cast<int32_t>(cost) + delta, -128, 127));
+    }
 
     // update prefetch stats and reset prefetch bit
     if (useful_prefetch) {
@@ -748,8 +808,10 @@ void CACHE::phc_sampler_access(const tag_lookup_type& request)
     return;
   }
 
-  if (dam.enabled && request.type != access_type::WRITE) {
+  if (dam.enabled && (request.type != access_type::WRITE || dam.writeback_reuse)) {
     // DAM: a demand hit to a sampled block raises its PC's reuse state.
+    // Stage 2b (dam_writeback_reuse): in this non-inclusive LLC a writeback hit
+    // also counts, since evicting the line early forces a writeback-miss allocation.
     auto& state = dam.rst.at(entry->dam_pc);
     state = (state == 255) ? uint8_t{255} : static_cast<uint8_t>(state + 1);
     ++sim_stats.dam_reuse_training;
@@ -802,9 +864,26 @@ bool CACHE::dam_block_dead(long set, long way) const
   if (!dam.enabled)
     return false;
   const auto idx = static_cast<std::size_t>(set * NUM_WAY + way);
-  if (!block.at(idx).valid || dam.block_has_pc.at(idx) == 0)
+  if (!block.at(idx).valid)
     return false;
+  if (dam.block_has_pc.at(idx) == 0)
+    return dam.nopc_dead; // writeback-miss fills: never dead (Stage 2) or always dead (Stage 2b)
   return dam.rst.at(dam.block_pc.at(idx)) < dam_threshold_for_set(set);
+}
+
+int CACHE::dam_block_cost(long set, long way) const
+{
+  if (!dam.dm)
+    return 0;
+  return dam.block_cost.at(static_cast<std::size_t>(set * NUM_WAY + way));
+}
+
+void CACHE::dam_set_pending_migration(long set, long from, long to)
+{
+  dam.pending.valid = true;
+  dam.pending.set = set;
+  dam.pending.from = from;
+  dam.pending.to = to;
 }
 
 void CACHE::dam_record_demand_miss(long set)
@@ -1244,6 +1323,8 @@ void CACHE::end_phase(unsigned finished_cpu)
   roi_stats.dam_dead_training = sim_stats.dam_dead_training;
   roi_stats.dam_phases = sim_stats.dam_phases;
   roi_stats.dam_phases_b = sim_stats.dam_phases_b;
+  roi_stats.dam_migrations_to_sram = sim_stats.dam_migrations_to_sram;
+  roi_stats.dam_migrations_to_sttram = sim_stats.dam_migrations_to_sttram;
 
   for (auto* ul : upper_levels) {
     ul->roi_stats.RQ_ACCESS = ul->sim_stats.RQ_ACCESS;

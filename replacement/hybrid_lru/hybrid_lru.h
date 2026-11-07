@@ -15,6 +15,13 @@ class hybrid_lru : public champsim::modules::replacement
   std::vector<uint64_t> last_used_cycles;
   uint64_t cycle = 0;
 
+  // Stage 3 (DM): migration chosen by find_victim, applied to the LRU state in replacement_cache_fill.
+  long pending_set = -1, pending_from = -1, pending_to = -1;
+
+  [[nodiscard]] uint64_t stamp(long set, long way) const { return last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + way)); }
+  // Least recently used predicted-dead way in [first, last), or -1.
+  [[nodiscard]] long lru_dead_way(long set, long first, long last) const;
+
 public:
   explicit hybrid_lru(CACHE* cache_);
 

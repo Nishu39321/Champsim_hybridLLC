@@ -6,7 +6,7 @@
 #   PARALLEL=1 JOBS=4 ./run_dam_phc_traces.zsh            # all configs, up to 4 runs at once (logs only)
 #   CONFIGS="dvs" PARALLEL=1 JOBS=4 ./run_dam_phc_traces.zsh   # only the selected configs
 #
-# Configs: sram_only sttram_only phc_wip dvs
+# Configs: sram_only sttram_only phc_wip dvs dvs2b dvs2b_wb dvs2b_nopc dm
 # WARMUP / SIMULATION set the instruction counts (default 10M / 100M).
 
 set -euo pipefail
@@ -17,7 +17,7 @@ WARMUP="${WARMUP:-10000000}"
 SIMULATION="${SIMULATION:-100000000}"
 PARALLEL="${PARALLEL:-0}"
 JOBS="${JOBS:-3}"
-CONFIGS="${CONFIGS:-sram_only sttram_only phc_wip dvs}"
+CONFIGS="${CONFIGS:-sram_only sttram_only phc_wip dvs dvs2b}"
 
 typeset -A config_bin
 config_bin=(
@@ -25,6 +25,10 @@ config_bin=(
   sttram_only "${CHAMPSIM_DIR}/bin/champsim-dam-sttram-only"
   phc_wip     "${CHAMPSIM_DIR}/bin/champsim-dam-phc-wip"
   dvs         "${CHAMPSIM_DIR}/bin/champsim-dam-dvs"
+  dvs2b       "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b"
+  dvs2b_wb    "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b-wb"
+  dvs2b_nopc  "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b-nopc"
+  dm          "${CHAMPSIM_DIR}/bin/champsim-dam-dm"
 )
 
 run_one() {
@@ -94,7 +98,7 @@ else
 fi
 
 CSV="${OUTDIR}/comparison.csv"
-print 'workload,configuration,instructions,cycles,ipc,llc_load_misses,llc_load_mpki,llc_rfo_misses,llc_demand_misses,llc_demand_mpki,llc_miss_latency_cycles,sram_reads,sram_writes,sttram_reads,sttram_writes,phc_sram_placements,phc_sttram_placements,phc_hot_training_events,phc_cold_training_events,dam_dead_victims,dam_lru_victims,dam_dead_in_other_portion,dam_reuse_training,dam_dead_training,dam_phases,dam_phases_b' > "$CSV"
+print 'workload,configuration,instructions,cycles,ipc,llc_load_misses,llc_load_mpki,llc_rfo_misses,llc_demand_misses,llc_demand_mpki,llc_miss_latency_cycles,sram_reads,sram_writes,sttram_reads,sttram_writes,phc_sram_placements,phc_sttram_placements,phc_hot_training_events,phc_cold_training_events,dam_dead_victims,dam_lru_victims,dam_dead_in_other_portion,dam_reuse_training,dam_dead_training,dam_phases,dam_phases_b,dam_migrations_to_sram,dam_migrations_to_sttram' > "$CSV"
 
 for json in "${OUTDIR}"/*.json(N); do
   filename="${json:t:r}"
@@ -130,7 +134,8 @@ for json in "${OUTDIR}"/*.json(N); do
       ($h["PHC hot training events"] // 0), ($h["PHC cold training events"] // 0),
       ($h["DAM dead victims"] // 0), ($h["DAM LRU victims"] // 0), ($h["DAM dead in other portion"] // 0),
       ($h["DAM reuse training"] // 0), ($h["DAM dead training"] // 0),
-      ($h["DAM dueling phases"] // 0), ($h["DAM dueling phases threshold B"] // 0)
+      ($h["DAM dueling phases"] // 0), ($h["DAM dueling phases threshold B"] // 0),
+      ($h["DAM migrations to SRAM"] // 0), ($h["DAM migrations to STTRAM"] // 0)
     ] | @csv
   ' "$json" >> "$CSV"
 done

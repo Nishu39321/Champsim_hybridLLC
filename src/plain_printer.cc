@@ -137,6 +137,11 @@ std::vector<std::string> champsim::plain_printer::format(CACHE::stats_type stats
                                   stats.dam_reuse_training, stats.dam_dead_training, stats.dam_phases, stats.dam_phases_b));
     }
 
+    if (stats.dam_migrations_to_sram != 0 || stats.dam_migrations_to_sttram != 0) {
+      lines.push_back(fmt::format("cpu{}->{} DAM DM MIGRATIONS TO SRAM: {:10} TO STTRAM: {:10}", cpu, stats.name, stats.dam_migrations_to_sram,
+                                  stats.dam_migrations_to_sttram));
+    }
+
     uint64_t total_downstream_demands = total_fill - stats.fill.value_or(std::pair{access_type::PREFETCH, cpu}, fill_value_type{});
     lines.push_back(
         fmt::format("cpu{}->{} AVERAGE MISS LATENCY: {} cycles", cpu, stats.name, ::print_ratio(stats.total_miss_latency_cycles, total_downstream_demands)));

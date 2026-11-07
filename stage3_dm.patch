@@ -1,0 +1,517 @@
+diff --git a/config/instantiation_file.py b/config/instantiation_file.py
+index 2178aff..592ebe8 100644
+--- a/config/instantiation_file.py
++++ b/config/instantiation_file.py
+@@ -112,7 +112,8 @@ cache_builder_parts = {
+     'dam_threshold_b': '.dam_threshold_b({dam_threshold_b})',
+     'dam_dueling_phase': '.dam_dueling_phase({dam_dueling_phase})',
+     'dam_writeback_reuse': '.set_dam_writeback_reuse()',
+-    'dam_nopc_dead': '.set_dam_nopc_dead()'
++    'dam_nopc_dead': '.set_dam_nopc_dead()',
++    'dam_dm': '.set_dam_dm()'
+ }
+ 
+ ptw_builder_parts = {
+diff --git a/configs/README-dam-phc-stage1.md b/configs/README-dam-phc-stage1.md
+index f8abc8d..a989cef 100644
+--- a/configs/README-dam-phc-stage1.md
++++ b/configs/README-dam-phc-stage1.md
+@@ -102,3 +102,27 @@ DAM's inclusive LLC it always hits). Two switches address this:
+ | `dam_dvs2b.json` | on | on |
+ | `dam_dvs2b_wb.json` | on | off |
+ | `dam_dvs2b_nopc.json` | off | on |
++
++## Stage 3: DAM dead-block-based migration (`dam_dm.json`)
++
++Built on `dam_dvs2b_wb.json` (PHC placement + dead-block predictor with
++writeback hits counted as reuse) plus `dam_dm`. On a fill into a full
++portion (DAM Fig. 4a):
++
++1. A predicted-dead block in the target portion is evicted (DVS).
++2. Otherwise, if the *other* portion has a predicted-dead block (the least
++   recently used one is chosen), it is evicted and a block of the target
++   portion is migrated into its slot; the incoming block takes the freed way:
++   * incoming block -> SRAM: the most read-intensive SRAM block (lowest
++     per-block cost; ties: least recently used) moves to STT-RAM;
++   * incoming block -> STT-RAM: the most write-intensive STT-RAM block
++     (highest cost; ties: most recently used) moves to SRAM.
++3. Otherwise LRU within the target portion.
++
++Per-block cost: 8-bit signed, reset to 0 on fill, +24 per write hit and -1
++per read hit (the PHC deltas). The migrated block keeps its dirty bit,
++predictor metadata, cost and LRU position. Migration accounting: one read
++of the source medium and one write of the destination medium (counted in the
++SRAM/STT-RAM read/write totals and reserving their ports, off the critical
++path), plus `DAM migrations to SRAM` / `DAM migrations to STTRAM`. A dirty
++dead block is written back as for a normal eviction.
+diff --git a/configs/dam_dm.json b/configs/dam_dm.json
+new file mode 100644
+index 0000000..26f5481
+--- /dev/null
++++ b/configs/dam_dm.json
+@@ -0,0 +1,63 @@
++{
++  "executable_name": "champsim-dam-dm",
++  "num_cores": 1,
++  "ooo_cpu": [
++    {
++      "frequency": 2660,
++      "rob_size": 128,
++      "fetch_width": 4,
++      "decode_width": 4,
++      "dispatch_width": 4,
++      "execute_width": 4,
++      "retire_width": 4,
++      "L1I": {
++        "sets": 128,
++        "ways": 4,
++        "latency": 4
++      },
++      "L1D": {
++        "sets": 64,
++        "ways": 8,
++        "latency": 4
++      },
++      "L2C": {
++        "sets": 512,
++        "ways": 8,
++        "latency": 8
++      }
++    }
++  ],
++  "LLC": {
++    "sets": 8192,
++    "ways": 16,
++    "hit_latency": 1,
++    "fill_latency": 1,
++    "max_tag_check": 8,
++    "max_fill": 8,
++    "mshr_size": 64,
++    "hybrid_llc": true,
++    "sram_ways": 4,
++    "sram_read_latency": 30,
++    "sram_write_latency": 30,
++    "sttram_read_latency": 30,
++    "sttram_write_latency": 120,
++    "sram_read_ports": 8,
++    "sram_write_ports": 8,
++    "sttram_read_ports": 8,
++    "sttram_write_ports": 8,
++    "hybrid_policy": "read_stt_write_sram",
++    "phc_predictor": true,
++    "phc_threshold": 20,
++    "phc_read_delta": -1,
++    "phc_write_delta": 24,
++    "phc_sampler_period": 32,
++    "dam_dvs": true,
++    "dam_rst_init": 128,
++    "dam_threshold_a": 64,
++    "dam_threshold_b": 128,
++    "dam_dueling_phase": 4096,
++    "dam_writeback_reuse": true,
++    "dam_dm": true,
++    "replacement": "hybrid_lru"
++  }
++}
+diff --git a/inc/cache.h b/inc/cache.h
+index 6119815..d0e1de3 100644
+--- a/inc/cache.h
++++ b/inc/cache.h
+@@ -232,6 +232,13 @@ public:
+     bool followers_use_b = false;
+     bool writeback_reuse = false; // Stage 2b: writeback hits train as reuse
+     bool nopc_dead = false;       // Stage 2b: lines without a trigger PC are predicted dead
++    // Stage 3: dead-block-based migration (DM)
++    bool dm = false;
++    std::vector<int8_t> block_cost{}; // per-block 8-bit write-intensity cost (+write delta / +read delta per hit)
++    struct pending_migration_type {
++      bool valid = false;
++      long set = 0, from = 0, to = 0; // move block `from` into dead slot `to`; the incoming block then fills `from`
++    } pending{};
+   };
+   dam_state_type dam{};
+ 
+@@ -239,6 +246,12 @@ public:
+   [[nodiscard]] bool dam_dvs_enabled() const { return dam.enabled; }
+   /** True if the valid block at (set, way) is predicted dead by the reuse-state table. */
+   [[nodiscard]] bool dam_block_dead(long set, long way) const;
++  /** True if DAM dead-block-based migration (DM) is enabled. */
++  [[nodiscard]] bool dam_dm_enabled() const { return dam.dm; }
++  /** Per-block write-intensity cost used to pick the migration candidate. */
++  [[nodiscard]] int dam_block_cost(long set, long way) const;
++  /** Called by the replacement policy: move block `from` into dead slot `to`, then fill the incoming block into `from`. */
++  void dam_set_pending_migration(long set, long from, long to);
+ 
+   using stats_type = cache_stats;
+ 
+@@ -430,10 +443,15 @@ public:
+       dam.phase_length = std::max(1u, b.m_dam_dueling_phase);
+       dam.writeback_reuse = b.m_dam_writeback_reuse;
+       dam.nopc_dead = b.m_dam_nopc_dead;
++      dam.dm = b.m_dam_dm;
+       dam.rst.assign(256, static_cast<uint8_t>(dam.rst_init));
+       dam.block_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
+       dam.block_has_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
++      if (dam.dm)
++        dam.block_cost.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
+     }
++    if (b.m_dam_dm && !b.m_dam_dvs)
++      throw std::invalid_argument{"dam_dm requires dam_dvs (it uses the dead-block predictor)"};
+   }
+ 
+   CACHE(const CACHE&) = delete;
+diff --git a/inc/cache_builder.h b/inc/cache_builder.h
+index 96d86ff..c1c7412 100644
+--- a/inc/cache_builder.h
++++ b/inc/cache_builder.h
+@@ -82,6 +82,7 @@ struct cache_builder_base {
+   uint32_t m_dam_dueling_phase{4096};
+   bool m_dam_writeback_reuse{};
+   bool m_dam_nopc_dead{};
++  bool m_dam_dm{};
+ 
+   std::vector<access_type> m_pref_act_mask{access_type::LOAD, access_type::PREFETCH};
+   std::vector<champsim::channel*> m_uls{};
+@@ -274,6 +275,8 @@ public:
+   self_type& set_dam_writeback_reuse();
+   /** Stage 2b: predict lines without a trigger PC (writeback-miss fills) as dead. */
+   self_type& set_dam_nopc_dead();
++  /** Stage 3: DAM dead-block-based migration (DM) across the SRAM/STT-RAM portions. Requires dam_dvs. */
++  self_type& set_dam_dm();
+ 
+   /**
+    * Specify the ``access_type`` values that should activate the prefetcher.
+@@ -712,6 +715,13 @@ auto champsim::cache_builder<P, R>::set_dam_nopc_dead() -> self_type&
+   return *this;
+ }
+ 
++template <typename P, typename R>
++auto champsim::cache_builder<P, R>::set_dam_dm() -> self_type&
++{
++  m_dam_dm = true;
++  return *this;
++}
++
+ template <typename P, typename R>
+ template <typename... Elems>
+ auto champsim::cache_builder<P, R>::prefetch_activate(Elems... pref_act_elems) -> self_type&
+diff --git a/inc/cache_stats.h b/inc/cache_stats.h
+index 3f07694..1c2e3db 100644
+--- a/inc/cache_stats.h
++++ b/inc/cache_stats.h
+@@ -34,6 +34,9 @@ struct cache_stats {
+   uint64_t dam_dead_training = 0;        // reuse-state table decrements (sampler evictions)
+   uint64_t dam_phases = 0;               // set-dueling phases completed
+   uint64_t dam_phases_b = 0;             // phases after which followers used threshold B
++  // DAM dead-block-based migration (Stage 3)
++  uint64_t dam_migrations_to_sram = 0;   // STT-RAM block moved into a dead SRAM slot (incoming block -> STT-RAM)
++  uint64_t dam_migrations_to_sttram = 0; // SRAM block moved into a dead STT-RAM slot (incoming block -> SRAM)
+ 
+   champsim::stats::event_counter<std::pair<access_type, std::remove_cv_t<decltype(NUM_CPUS)>>> hits = {};
+   champsim::stats::event_counter<std::pair<access_type, std::remove_cv_t<decltype(NUM_CPUS)>>> misses = {};
+diff --git a/replacement/hybrid_lru/hybrid_lru.cc b/replacement/hybrid_lru/hybrid_lru.cc
+index 0220f8a..6e4c6c3 100644
+--- a/replacement/hybrid_lru/hybrid_lru.cc
++++ b/replacement/hybrid_lru/hybrid_lru.cc
+@@ -8,33 +8,65 @@ hybrid_lru::hybrid_lru(CACHE* cache_) : replacement(cache_), cache(cache_), NUM_
+ {
+ }
+ 
++long hybrid_lru::lru_dead_way(long set, long first, long last) const
++{
++  long dead_way = -1;
++  for (long way = first; way < last; ++way) {
++    if (cache->dam_block_dead(set, way) && (dead_way < 0 || stamp(set, way) < stamp(set, dead_way)))
++      dead_way = way;
++  }
++  return dead_way;
++}
++
+ long hybrid_lru::find_victim(uint32_t, uint64_t, long set, const champsim::cache_block*, champsim::address, champsim::address, access_type,
+                              bool target_sram)
+ {
+   const auto [first_way, last_way] = cache->hybrid_way_range(target_sram);
+   assert(first_way < last_way);
+-  auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY + first_way);
+-  auto end = std::next(std::begin(last_used_cycles), set * NUM_WAY + last_way);
++  pending_set = -1;
+ 
+-  // DAM DVS (Stage 2): prefer a predicted-dead block in the target portion
+-  // (the least recently used one if there are several); otherwise plain LRU.
+   if (cache->dam_dvs_enabled()) {
+-    long dead_way = -1;
+-    for (long way = first_way; way < last_way; ++way) {
+-      if (cache->dam_block_dead(set, way)
+-          && (dead_way < 0 || last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + way)) < last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + dead_way))))
+-        dead_way = way;
+-    }
+-    if (dead_way >= 0)
++    // DAM DVS (Stage 2): prefer the least recently used predicted-dead block in the target portion.
++    if (const long dead_way = lru_dead_way(set, first_way, last_way); dead_way >= 0)
+       return dead_way;
++
++    // DAM DM (Stage 3): no dead block in the target portion, but one in the other portion.
++    // Move a block of the target portion into the dead slot and give its way to the incoming block:
++    //  - incoming block -> SRAM:    move the most read-intensive SRAM block (lowest cost; ties: least recently used)
++    //  - incoming block -> STT-RAM: move the most write-intensive STT-RAM block (highest cost; ties: most recently used)
++    if (cache->dam_dm_enabled()) {
++      const auto [other_first, other_last] = cache->hybrid_way_range(!target_sram);
++      if (const long dead_other = lru_dead_way(set, other_first, other_last); dead_other >= 0) {
++        long migrant = first_way;
++        for (long way = first_way + 1; way < last_way; ++way) {
++          const int cost = cache->dam_block_cost(set, way);
++          const int best = cache->dam_block_cost(set, migrant);
++          if (target_sram ? (cost < best || (cost == best && stamp(set, way) < stamp(set, migrant)))
++                          : (cost > best || (cost == best && stamp(set, way) > stamp(set, migrant))))
++            migrant = way;
++        }
++        pending_set = set;
++        pending_from = migrant;
++        pending_to = dead_other;
++        cache->dam_set_pending_migration(set, migrant, dead_other);
++        return migrant;
++      }
++    }
+   }
+ 
++  auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY + first_way);
++  auto end = std::next(std::begin(last_used_cycles), set * NUM_WAY + last_way);
+   auto victim = std::min_element(begin, end);
+   return first_way + std::distance(begin, victim);
+ }
+ 
+ void hybrid_lru::replacement_cache_fill(uint32_t, long set, long way, champsim::address, champsim::address, champsim::address, access_type)
+ {
++  if (pending_set == set && pending_from == way && cache->dam.pending.valid && cache->dam.pending.set == set && cache->dam.pending.from == way) {
++    // DM: the migrated block keeps its recency in its new way.
++    last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + pending_to)) = stamp(set, pending_from);
++  }
++  pending_set = -1;
+   last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + way)) = cycle++;
+ }
+ 
+diff --git a/replacement/hybrid_lru/hybrid_lru.h b/replacement/hybrid_lru/hybrid_lru.h
+index 6750095..69736e7 100644
+--- a/replacement/hybrid_lru/hybrid_lru.h
++++ b/replacement/hybrid_lru/hybrid_lru.h
+@@ -15,6 +15,13 @@ class hybrid_lru : public champsim::modules::replacement
+   std::vector<uint64_t> last_used_cycles;
+   uint64_t cycle = 0;
+ 
++  // Stage 3 (DM): migration chosen by find_victim, applied to the LRU state in replacement_cache_fill.
++  long pending_set = -1, pending_from = -1, pending_to = -1;
++
++  [[nodiscard]] uint64_t stamp(long set, long way) const { return last_used_cycles.at(static_cast<std::size_t>(set * NUM_WAY + way)); }
++  // Least recently used predicted-dead way in [first, last), or -1.
++  [[nodiscard]] long lru_dead_way(long set, long first, long last) const;
++
+ public:
+   explicit hybrid_lru(CACHE* cache_);
+ 
+diff --git a/run_dam_phc_traces.zsh b/run_dam_phc_traces.zsh
+index e3182c9..7aca643 100755
+--- a/run_dam_phc_traces.zsh
++++ b/run_dam_phc_traces.zsh
+@@ -6,7 +6,7 @@
+ #   PARALLEL=1 JOBS=4 ./run_dam_phc_traces.zsh            # all configs, up to 4 runs at once (logs only)
+ #   CONFIGS="dvs" PARALLEL=1 JOBS=4 ./run_dam_phc_traces.zsh   # only the selected configs
+ #
+-# Configs: sram_only sttram_only phc_wip dvs dvs2b dvs2b_wb dvs2b_nopc
++# Configs: sram_only sttram_only phc_wip dvs dvs2b dvs2b_wb dvs2b_nopc dm
+ # WARMUP / SIMULATION set the instruction counts (default 10M / 100M).
+ 
+ set -euo pipefail
+@@ -28,6 +28,7 @@ config_bin=(
+   dvs2b       "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b"
+   dvs2b_wb    "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b-wb"
+   dvs2b_nopc  "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b-nopc"
++  dm          "${CHAMPSIM_DIR}/bin/champsim-dam-dm"
+ )
+ 
+ run_one() {
+@@ -97,7 +98,7 @@ else
+ fi
+ 
+ CSV="${OUTDIR}/comparison.csv"
+-print 'workload,configuration,instructions,cycles,ipc,llc_load_misses,llc_load_mpki,llc_rfo_misses,llc_demand_misses,llc_demand_mpki,llc_miss_latency_cycles,sram_reads,sram_writes,sttram_reads,sttram_writes,phc_sram_placements,phc_sttram_placements,phc_hot_training_events,phc_cold_training_events,dam_dead_victims,dam_lru_victims,dam_dead_in_other_portion,dam_reuse_training,dam_dead_training,dam_phases,dam_phases_b' > "$CSV"
++print 'workload,configuration,instructions,cycles,ipc,llc_load_misses,llc_load_mpki,llc_rfo_misses,llc_demand_misses,llc_demand_mpki,llc_miss_latency_cycles,sram_reads,sram_writes,sttram_reads,sttram_writes,phc_sram_placements,phc_sttram_placements,phc_hot_training_events,phc_cold_training_events,dam_dead_victims,dam_lru_victims,dam_dead_in_other_portion,dam_reuse_training,dam_dead_training,dam_phases,dam_phases_b,dam_migrations_to_sram,dam_migrations_to_sttram' > "$CSV"
+ 
+ for json in "${OUTDIR}"/*.json(N); do
+   filename="${json:t:r}"
+@@ -133,7 +134,8 @@ for json in "${OUTDIR}"/*.json(N); do
+       ($h["PHC hot training events"] // 0), ($h["PHC cold training events"] // 0),
+       ($h["DAM dead victims"] // 0), ($h["DAM LRU victims"] // 0), ($h["DAM dead in other portion"] // 0),
+       ($h["DAM reuse training"] // 0), ($h["DAM dead training"] // 0),
+-      ($h["DAM dueling phases"] // 0), ($h["DAM dueling phases threshold B"] // 0)
++      ($h["DAM dueling phases"] // 0), ($h["DAM dueling phases threshold B"] // 0),
++      ($h["DAM migrations to SRAM"] // 0), ($h["DAM migrations to STTRAM"] // 0)
+     ] | @csv
+   ' "$json" >> "$CSV"
+ done
+diff --git a/src/cache.cc b/src/cache.cc
+index ab57b0e..78d1fa8 100644
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -212,6 +212,7 @@ bool CACHE::handle_fill(const fill_type& fill)
+   auto medium_begin = std::next(set_begin, medium_begin_idx);
+   auto medium_end = std::next(set_begin, medium_end_idx);
+   auto way = std::find_if_not(medium_begin, medium_end, [](auto x) { return x.valid; });
++  dam.pending.valid = false;
+   if (way == medium_end) {
+     way = std::next(set_begin,
+                     impl_find_victim(fill.cpu, fill.instr_id, get_set_index(fill.address), &*set_begin, fill.ip, fill.address, fill.type, fill.target_sram));
+@@ -227,6 +228,56 @@ bool CACHE::handle_fill(const fill_type& fill)
+                fill.data_promise->pf_metadata, (fill.time_enqueued.time_since_epoch()) / clock_period, (current_time.time_since_epoch()) / clock_period);
+   }
+ 
++  // Stage 3 (DM): the replacement policy found no dead block in the target
++  // portion but one in the other portion. Evict that dead block, move the
++  // chosen block of the target portion into its slot, and fill the incoming
++  // block into the freed way.
++  if (dam.dm && dam.pending.valid && dam.pending.set == get_set_index(fill.address) && dam.pending.from == way_idx) {
++    const long set_idx = dam.pending.set;
++    auto dead = std::next(set_begin, dam.pending.to);
++    if (dead->valid && dead->dirty) {
++      request_type writeback_packet;
++      writeback_packet.cpu = fill.cpu;
++      writeback_packet.address = dead->address;
++      writeback_packet.data = dead->data;
++      writeback_packet.instr_id = fill.instr_id;
++      writeback_packet.ip = champsim::address{};
++      writeback_packet.type = access_type::WRITE;
++      writeback_packet.pf_metadata = dead->pf_metadata;
++      writeback_packet.response_requested = false;
++      if (!lower_level->add_wq(writeback_packet))
++        return false; // retried next cycle; no state has changed
++    }
++    if (dead->valid && dead->prefetch)
++      ++sim_stats.pf_useless;
++    ++sim_stats.dam_dead_victims;
++
++    // Move the block and its predictor metadata (replacement state is moved by hybrid_lru).
++    const auto from_idx = static_cast<std::size_t>(set_idx * NUM_WAY + dam.pending.from);
++    const auto to_idx = static_cast<std::size_t>(set_idx * NUM_WAY + dam.pending.to);
++    *dead = *way;
++    dam.block_pc.at(to_idx) = dam.block_pc.at(from_idx);
++    dam.block_has_pc.at(to_idx) = dam.block_has_pc.at(from_idx);
++    dam.block_cost.at(to_idx) = dam.block_cost.at(from_idx);
++    way->valid = false; // the incoming block now fills an empty way
++
++    // Migration traffic: read from the source medium, write into the destination medium.
++    const bool src_sram = is_sram_way(dam.pending.from);
++    const bool dst_sram = is_sram_way(dam.pending.to);
++    if (dst_sram)
++      ++sim_stats.dam_migrations_to_sram;
++    else
++      ++sim_stats.dam_migrations_to_sttram;
++    if (hybrid_llc) {
++      if (!warmup) {
++        reserve_medium_port(src_sram, false, medium_latency(src_sram, false));
++        reserve_medium_port(dst_sram, true, medium_latency(dst_sram, true));
++      }
++      count_medium_access(src_sram, false);
++      count_medium_access(dst_sram, true);
++    }
++  }
++
+   if (dam.enabled && way != set_end && way->valid)
+     dam_note_eviction(get_set_index(fill.address), way_idx);
+ 
+@@ -278,6 +329,8 @@ bool CACHE::handle_fill(const fill_type& fill)
+       const bool has_pc = (fill.ip != champsim::address{}) && (fill.type != access_type::WRITE);
+       dam.block_pc.at(idx) = has_pc ? dam_hash_pc(fill.ip) : uint8_t{0};
+       dam.block_has_pc.at(idx) = has_pc ? 1 : 0;
++      if (dam.dm)
++        dam.block_cost.at(idx) = 0;
+     }
+     if (hybrid_llc)
+       count_medium_access(is_sram_way(way_idx), true);
+@@ -347,6 +400,13 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
+ 
+     way->dirty |= (handle_pkt.type == access_type::WRITE);
+ 
++    if (dam.dm) {
++      // Stage 3: per-block write-intensity cost (same deltas as PHC: +24 per write, -1 per read).
++      auto& cost = dam.block_cost.at(static_cast<std::size_t>(get_set_index(handle_pkt.address) * NUM_WAY + way_idx));
++      const auto delta = (handle_pkt.type == access_type::WRITE) ? PHC_WRITE_DELTA : PHC_READ_DELTA;
++      cost = static_cast<int8_t>(std::clamp(static_cast<int32_t>(cost) + delta, -128, 127));
++    }
++
+     // update prefetch stats and reset prefetch bit
+     if (useful_prefetch) {
+       ++sim_stats.pf_useful;
+@@ -811,6 +871,21 @@ bool CACHE::dam_block_dead(long set, long way) const
+   return dam.rst.at(dam.block_pc.at(idx)) < dam_threshold_for_set(set);
+ }
+ 
++int CACHE::dam_block_cost(long set, long way) const
++{
++  if (!dam.dm)
++    return 0;
++  return dam.block_cost.at(static_cast<std::size_t>(set * NUM_WAY + way));
++}
++
++void CACHE::dam_set_pending_migration(long set, long from, long to)
++{
++  dam.pending.valid = true;
++  dam.pending.set = set;
++  dam.pending.from = from;
++  dam.pending.to = to;
++}
++
+ void CACHE::dam_record_demand_miss(long set)
+ {
+   switch (dam_leader(set)) {
+@@ -1248,6 +1323,8 @@ void CACHE::end_phase(unsigned finished_cpu)
+   roi_stats.dam_dead_training = sim_stats.dam_dead_training;
+   roi_stats.dam_phases = sim_stats.dam_phases;
+   roi_stats.dam_phases_b = sim_stats.dam_phases_b;
++  roi_stats.dam_migrations_to_sram = sim_stats.dam_migrations_to_sram;
++  roi_stats.dam_migrations_to_sttram = sim_stats.dam_migrations_to_sttram;
+ 
+   for (auto* ul : upper_levels) {
+     ul->roi_stats.RQ_ACCESS = ul->sim_stats.RQ_ACCESS;
+diff --git a/src/cache_stats.cc b/src/cache_stats.cc
+index 91efc22..17cead6 100644
+--- a/src/cache_stats.cc
++++ b/src/cache_stats.cc
+@@ -23,6 +23,8 @@ cache_stats operator-(cache_stats lhs, cache_stats rhs)
+   result.dam_dead_training = lhs.dam_dead_training - rhs.dam_dead_training;
+   result.dam_phases = lhs.dam_phases - rhs.dam_phases;
+   result.dam_phases_b = lhs.dam_phases_b - rhs.dam_phases_b;
++  result.dam_migrations_to_sram = lhs.dam_migrations_to_sram - rhs.dam_migrations_to_sram;
++  result.dam_migrations_to_sttram = lhs.dam_migrations_to_sttram - rhs.dam_migrations_to_sttram;
+ 
+   result.hits = lhs.hits - rhs.hits;
+   result.misses = lhs.misses - rhs.misses;
+diff --git a/src/json_printer.cc b/src/json_printer.cc
+index e3eab73..5ef158a 100644
+--- a/src/json_printer.cc
++++ b/src/json_printer.cc
+@@ -63,7 +63,9 @@ void to_json(nlohmann::json& j, const CACHE::stats_type& stats)
+                                                   {"DAM reuse training", stats.dam_reuse_training},
+                                                   {"DAM dead training", stats.dam_dead_training},
+                                                   {"DAM dueling phases", stats.dam_phases},
+-                                                  {"DAM dueling phases threshold B", stats.dam_phases_b}});
++                                                  {"DAM dueling phases threshold B", stats.dam_phases_b},
++                                                  {"DAM migrations to SRAM", stats.dam_migrations_to_sram},
++                                                  {"DAM migrations to STTRAM", stats.dam_migrations_to_sttram}});
+ 
+   uint64_t total_downstream_demands = stats.fill.total();
+   for (std::size_t cpu = 0; cpu < NUM_CPUS; ++cpu)
+diff --git a/src/plain_printer.cc b/src/plain_printer.cc
+index e0bd728..f51c9eb 100644
+--- a/src/plain_printer.cc
++++ b/src/plain_printer.cc
+@@ -137,6 +137,11 @@ std::vector<std::string> champsim::plain_printer::format(CACHE::stats_type stats
+                                   stats.dam_reuse_training, stats.dam_dead_training, stats.dam_phases, stats.dam_phases_b));
+     }
+ 
++    if (stats.dam_migrations_to_sram != 0 || stats.dam_migrations_to_sttram != 0) {
++      lines.push_back(fmt::format("cpu{}->{} DAM DM MIGRATIONS TO SRAM: {:10} TO STTRAM: {:10}", cpu, stats.name, stats.dam_migrations_to_sram,
++                                  stats.dam_migrations_to_sttram));
++    }
++
+     uint64_t total_downstream_demands = total_fill - stats.fill.value_or(std::pair{access_type::PREFETCH, cpu}, fill_value_type{});
+     lines.push_back(
+         fmt::format("cpu{}->{} AVERAGE MISS LATENCY: {} cycles", cpu, stats.name, ::print_ratio(stats.total_miss_latency_cycles, total_downstream_demands)));

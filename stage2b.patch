@@ -1,0 +1,373 @@
+diff --git a/config/instantiation_file.py b/config/instantiation_file.py
+index cf6c44f..2178aff 100644
+--- a/config/instantiation_file.py
++++ b/config/instantiation_file.py
+@@ -110,7 +110,9 @@ cache_builder_parts = {
+     'dam_rst_init': '.dam_rst_init({dam_rst_init})',
+     'dam_threshold_a': '.dam_threshold_a({dam_threshold_a})',
+     'dam_threshold_b': '.dam_threshold_b({dam_threshold_b})',
+-    'dam_dueling_phase': '.dam_dueling_phase({dam_dueling_phase})'
++    'dam_dueling_phase': '.dam_dueling_phase({dam_dueling_phase})',
++    'dam_writeback_reuse': '.set_dam_writeback_reuse()',
++    'dam_nopc_dead': '.set_dam_nopc_dead()'
+ }
+ 
+ ptw_builder_parts = {
+diff --git a/configs/README-dam-phc-stage1.md b/configs/README-dam-phc-stage1.md
+index 0cef357..f8abc8d 100644
+--- a/configs/README-dam-phc-stage1.md
++++ b/configs/README-dam-phc-stage1.md
+@@ -84,3 +84,21 @@ New statistics: `DAM dead victims`, `DAM LRU victims`, `DAM dead in other
+ portion` (LRU evictions where a dead block existed in the *other* portion:
+ the opportunity Stage 3's migration targets), RST training counts and the
+ number of set-dueling phases won by threshold B.
++
++## Stage 2b: non-inclusive corrections to the dead-block predictor
++
++ChampSim's LLC is non-inclusive, so an L2 writeback can miss in the LLC (in
++DAM's inclusive LLC it always hits). Two switches address this:
++
++* `dam_writeback_reuse`: a writeback hit to a sampled block trains as reuse
++  (evicting a line that will receive a writeback forces a writeback-miss
++  allocation).
++* `dam_nopc_dead`: lines filled by a writeback miss (no trigger PC) are
++  predicted dead instead of never dead.
++
++| Config | `dam_writeback_reuse` | `dam_nopc_dead` |
++| --- | --- | --- |
++| `dam_dvs.json` (Stage 2) | off | off |
++| `dam_dvs2b.json` | on | on |
++| `dam_dvs2b_wb.json` | on | off |
++| `dam_dvs2b_nopc.json` | off | on |
+diff --git a/configs/dam_dvs2b.json b/configs/dam_dvs2b.json
+new file mode 100644
+index 0000000..bd5dfaf
+--- /dev/null
++++ b/configs/dam_dvs2b.json
+@@ -0,0 +1,63 @@
++{
++  "executable_name": "champsim-dam-dvs2b",
++  "num_cores": 1,
++  "ooo_cpu": [
++    {
++      "frequency": 2660,
++      "rob_size": 128,
++      "fetch_width": 4,
++      "decode_width": 4,
++      "dispatch_width": 4,
++      "execute_width": 4,
++      "retire_width": 4,
++      "L1I": {
++        "sets": 128,
++        "ways": 4,
++        "latency": 4
++      },
++      "L1D": {
++        "sets": 64,
++        "ways": 8,
++        "latency": 4
++      },
++      "L2C": {
++        "sets": 512,
++        "ways": 8,
++        "latency": 8
++      }
++    }
++  ],
++  "LLC": {
++    "sets": 8192,
++    "ways": 16,
++    "hit_latency": 1,
++    "fill_latency": 1,
++    "max_tag_check": 8,
++    "max_fill": 8,
++    "mshr_size": 64,
++    "hybrid_llc": true,
++    "sram_ways": 4,
++    "sram_read_latency": 30,
++    "sram_write_latency": 30,
++    "sttram_read_latency": 30,
++    "sttram_write_latency": 120,
++    "sram_read_ports": 8,
++    "sram_write_ports": 8,
++    "sttram_read_ports": 8,
++    "sttram_write_ports": 8,
++    "hybrid_policy": "read_stt_write_sram",
++    "phc_predictor": true,
++    "phc_threshold": 20,
++    "phc_read_delta": -1,
++    "phc_write_delta": 24,
++    "phc_sampler_period": 32,
++    "dam_dvs": true,
++    "dam_rst_init": 128,
++    "dam_threshold_a": 64,
++    "dam_threshold_b": 128,
++    "dam_dueling_phase": 4096,
++    "dam_writeback_reuse": true,
++    "dam_nopc_dead": true,
++    "replacement": "hybrid_lru"
++  }
++}
+diff --git a/configs/dam_dvs2b_nopc.json b/configs/dam_dvs2b_nopc.json
+new file mode 100644
+index 0000000..b23f13b
+--- /dev/null
++++ b/configs/dam_dvs2b_nopc.json
+@@ -0,0 +1,62 @@
++{
++  "executable_name": "champsim-dam-dvs2b-nopc",
++  "num_cores": 1,
++  "ooo_cpu": [
++    {
++      "frequency": 2660,
++      "rob_size": 128,
++      "fetch_width": 4,
++      "decode_width": 4,
++      "dispatch_width": 4,
++      "execute_width": 4,
++      "retire_width": 4,
++      "L1I": {
++        "sets": 128,
++        "ways": 4,
++        "latency": 4
++      },
++      "L1D": {
++        "sets": 64,
++        "ways": 8,
++        "latency": 4
++      },
++      "L2C": {
++        "sets": 512,
++        "ways": 8,
++        "latency": 8
++      }
++    }
++  ],
++  "LLC": {
++    "sets": 8192,
++    "ways": 16,
++    "hit_latency": 1,
++    "fill_latency": 1,
++    "max_tag_check": 8,
++    "max_fill": 8,
++    "mshr_size": 64,
++    "hybrid_llc": true,
++    "sram_ways": 4,
++    "sram_read_latency": 30,
++    "sram_write_latency": 30,
++    "sttram_read_latency": 30,
++    "sttram_write_latency": 120,
++    "sram_read_ports": 8,
++    "sram_write_ports": 8,
++    "sttram_read_ports": 8,
++    "sttram_write_ports": 8,
++    "hybrid_policy": "read_stt_write_sram",
++    "phc_predictor": true,
++    "phc_threshold": 20,
++    "phc_read_delta": -1,
++    "phc_write_delta": 24,
++    "phc_sampler_period": 32,
++    "dam_dvs": true,
++    "dam_rst_init": 128,
++    "dam_threshold_a": 64,
++    "dam_threshold_b": 128,
++    "dam_dueling_phase": 4096,
++    "dam_nopc_dead": true,
++    "replacement": "hybrid_lru"
++  }
++}
+diff --git a/configs/dam_dvs2b_wb.json b/configs/dam_dvs2b_wb.json
+new file mode 100644
+index 0000000..e4749ea
+--- /dev/null
++++ b/configs/dam_dvs2b_wb.json
+@@ -0,0 +1,62 @@
++{
++  "executable_name": "champsim-dam-dvs2b-wb",
++  "num_cores": 1,
++  "ooo_cpu": [
++    {
++      "frequency": 2660,
++      "rob_size": 128,
++      "fetch_width": 4,
++      "decode_width": 4,
++      "dispatch_width": 4,
++      "execute_width": 4,
++      "retire_width": 4,
++      "L1I": {
++        "sets": 128,
++        "ways": 4,
++        "latency": 4
++      },
++      "L1D": {
++        "sets": 64,
++        "ways": 8,
++        "latency": 4
++      },
++      "L2C": {
++        "sets": 512,
++        "ways": 8,
++        "latency": 8
++      }
++    }
++  ],
++  "LLC": {
++    "sets": 8192,
++    "ways": 16,
++    "hit_latency": 1,
++    "fill_latency": 1,
++    "max_tag_check": 8,
++    "max_fill": 8,
++    "mshr_size": 64,
++    "hybrid_llc": true,
++    "sram_ways": 4,
++    "sram_read_latency": 30,
++    "sram_write_latency": 30,
++    "sttram_read_latency": 30,
++    "sttram_write_latency": 120,
++    "sram_read_ports": 8,
++    "sram_write_ports": 8,
++    "sttram_read_ports": 8,
++    "sttram_write_ports": 8,
++    "hybrid_policy": "read_stt_write_sram",
++    "phc_predictor": true,
++    "phc_threshold": 20,
++    "phc_read_delta": -1,
++    "phc_write_delta": 24,
++    "phc_sampler_period": 32,
++    "dam_dvs": true,
++    "dam_rst_init": 128,
++    "dam_threshold_a": 64,
++    "dam_threshold_b": 128,
++    "dam_dueling_phase": 4096,
++    "dam_writeback_reuse": true,
++    "replacement": "hybrid_lru"
++  }
++}
+diff --git a/inc/cache.h b/inc/cache.h
+index 326ee08..6119815 100644
+--- a/inc/cache.h
++++ b/inc/cache.h
+@@ -230,6 +230,8 @@ public:
+     std::vector<uint8_t> block_has_pc{}; // 0 for lines with no trigger PC (e.g. writeback fills): never predicted dead
+     uint64_t leader_misses_a = 0, leader_misses_b = 0, phase_misses = 0;
+     bool followers_use_b = false;
++    bool writeback_reuse = false; // Stage 2b: writeback hits train as reuse
++    bool nopc_dead = false;       // Stage 2b: lines without a trigger PC are predicted dead
+   };
+   dam_state_type dam{};
+ 
+@@ -426,6 +428,8 @@ public:
+       dam.threshold_a = std::min(256u, b.m_dam_threshold_a);
+       dam.threshold_b = std::min(256u, b.m_dam_threshold_b);
+       dam.phase_length = std::max(1u, b.m_dam_dueling_phase);
++      dam.writeback_reuse = b.m_dam_writeback_reuse;
++      dam.nopc_dead = b.m_dam_nopc_dead;
+       dam.rst.assign(256, static_cast<uint8_t>(dam.rst_init));
+       dam.block_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
+       dam.block_has_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
+diff --git a/inc/cache_builder.h b/inc/cache_builder.h
+index b5a4d4d..96d86ff 100644
+--- a/inc/cache_builder.h
++++ b/inc/cache_builder.h
+@@ -80,6 +80,8 @@ struct cache_builder_base {
+   uint32_t m_dam_threshold_a{64};
+   uint32_t m_dam_threshold_b{128};
+   uint32_t m_dam_dueling_phase{4096};
++  bool m_dam_writeback_reuse{};
++  bool m_dam_nopc_dead{};
+ 
+   std::vector<access_type> m_pref_act_mask{access_type::LOAD, access_type::PREFETCH};
+   std::vector<champsim::channel*> m_uls{};
+@@ -268,6 +270,10 @@ public:
+   self_type& dam_threshold_a(uint32_t value_);
+   self_type& dam_threshold_b(uint32_t value_);
+   self_type& dam_dueling_phase(uint32_t value_);
++  /** Stage 2b: count a writeback hit to a sampled block as reuse when training the reuse-state table. */
++  self_type& set_dam_writeback_reuse();
++  /** Stage 2b: predict lines without a trigger PC (writeback-miss fills) as dead. */
++  self_type& set_dam_nopc_dead();
+ 
+   /**
+    * Specify the ``access_type`` values that should activate the prefetcher.
+@@ -692,6 +698,20 @@ auto champsim::cache_builder<P, R>::dam_dueling_phase(uint32_t value_) -> self_t
+   return *this;
+ }
+ 
++template <typename P, typename R>
++auto champsim::cache_builder<P, R>::set_dam_writeback_reuse() -> self_type&
++{
++  m_dam_writeback_reuse = true;
++  return *this;
++}
++
++template <typename P, typename R>
++auto champsim::cache_builder<P, R>::set_dam_nopc_dead() -> self_type&
++{
++  m_dam_nopc_dead = true;
++  return *this;
++}
++
+ template <typename P, typename R>
+ template <typename... Elems>
+ auto champsim::cache_builder<P, R>::prefetch_activate(Elems... pref_act_elems) -> self_type&
+diff --git a/run_dam_phc_traces.zsh b/run_dam_phc_traces.zsh
+index 86d5296..e3182c9 100755
+--- a/run_dam_phc_traces.zsh
++++ b/run_dam_phc_traces.zsh
+@@ -6,7 +6,7 @@
+ #   PARALLEL=1 JOBS=4 ./run_dam_phc_traces.zsh            # all configs, up to 4 runs at once (logs only)
+ #   CONFIGS="dvs" PARALLEL=1 JOBS=4 ./run_dam_phc_traces.zsh   # only the selected configs
+ #
+-# Configs: sram_only sttram_only phc_wip dvs
++# Configs: sram_only sttram_only phc_wip dvs dvs2b dvs2b_wb dvs2b_nopc
+ # WARMUP / SIMULATION set the instruction counts (default 10M / 100M).
+ 
+ set -euo pipefail
+@@ -17,7 +17,7 @@ WARMUP="${WARMUP:-10000000}"
+ SIMULATION="${SIMULATION:-100000000}"
+ PARALLEL="${PARALLEL:-0}"
+ JOBS="${JOBS:-3}"
+-CONFIGS="${CONFIGS:-sram_only sttram_only phc_wip dvs}"
++CONFIGS="${CONFIGS:-sram_only sttram_only phc_wip dvs dvs2b}"
+ 
+ typeset -A config_bin
+ config_bin=(
+@@ -25,6 +25,9 @@ config_bin=(
+   sttram_only "${CHAMPSIM_DIR}/bin/champsim-dam-sttram-only"
+   phc_wip     "${CHAMPSIM_DIR}/bin/champsim-dam-phc-wip"
+   dvs         "${CHAMPSIM_DIR}/bin/champsim-dam-dvs"
++  dvs2b       "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b"
++  dvs2b_wb    "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b-wb"
++  dvs2b_nopc  "${CHAMPSIM_DIR}/bin/champsim-dam-dvs2b-nopc"
+ )
+ 
+ run_one() {
+diff --git a/src/cache.cc b/src/cache.cc
+index 4dd7a1d..ab57b0e 100644
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -748,8 +748,10 @@ void CACHE::phc_sampler_access(const tag_lookup_type& request)
+     return;
+   }
+ 
+-  if (dam.enabled && request.type != access_type::WRITE) {
++  if (dam.enabled && (request.type != access_type::WRITE || dam.writeback_reuse)) {
+     // DAM: a demand hit to a sampled block raises its PC's reuse state.
++    // Stage 2b (dam_writeback_reuse): in this non-inclusive LLC a writeback hit
++    // also counts, since evicting the line early forces a writeback-miss allocation.
+     auto& state = dam.rst.at(entry->dam_pc);
+     state = (state == 255) ? uint8_t{255} : static_cast<uint8_t>(state + 1);
+     ++sim_stats.dam_reuse_training;
+@@ -802,8 +804,10 @@ bool CACHE::dam_block_dead(long set, long way) const
+   if (!dam.enabled)
+     return false;
+   const auto idx = static_cast<std::size_t>(set * NUM_WAY + way);
+-  if (!block.at(idx).valid || dam.block_has_pc.at(idx) == 0)
++  if (!block.at(idx).valid)
+     return false;
++  if (dam.block_has_pc.at(idx) == 0)
++    return dam.nopc_dead; // writeback-miss fills: never dead (Stage 2) or always dead (Stage 2b)
+   return dam.rst.at(dam.block_pc.at(idx)) < dam_threshold_for_set(set);
+ }
+ 

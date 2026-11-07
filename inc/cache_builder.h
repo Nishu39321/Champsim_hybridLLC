@@ -80,6 +80,9 @@ struct cache_builder_base {
   uint32_t m_dam_threshold_a{64};
   uint32_t m_dam_threshold_b{128};
   uint32_t m_dam_dueling_phase{4096};
+  bool m_dam_writeback_reuse{};
+  bool m_dam_nopc_dead{};
+  bool m_dam_dm{};
 
   std::vector<access_type> m_pref_act_mask{access_type::LOAD, access_type::PREFETCH};
   std::vector<champsim::channel*> m_uls{};
@@ -268,6 +271,12 @@ public:
   self_type& dam_threshold_a(uint32_t value_);
   self_type& dam_threshold_b(uint32_t value_);
   self_type& dam_dueling_phase(uint32_t value_);
+  /** Stage 2b: count a writeback hit to a sampled block as reuse when training the reuse-state table. */
+  self_type& set_dam_writeback_reuse();
+  /** Stage 2b: predict lines without a trigger PC (writeback-miss fills) as dead. */
+  self_type& set_dam_nopc_dead();
+  /** Stage 3: DAM dead-block-based migration (DM) across the SRAM/STT-RAM portions. Requires dam_dvs. */
+  self_type& set_dam_dm();
 
   /**
    * Specify the ``access_type`` values that should activate the prefetcher.
@@ -689,6 +698,27 @@ template <typename P, typename R>
 auto champsim::cache_builder<P, R>::dam_dueling_phase(uint32_t value_) -> self_type&
 {
   m_dam_dueling_phase = value_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::set_dam_writeback_reuse() -> self_type&
+{
+  m_dam_writeback_reuse = true;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::set_dam_nopc_dead() -> self_type&
+{
+  m_dam_nopc_dead = true;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::set_dam_dm() -> self_type&
+{
+  m_dam_dm = true;
   return *this;
 }
 

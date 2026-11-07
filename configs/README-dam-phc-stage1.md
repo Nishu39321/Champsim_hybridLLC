@@ -84,3 +84,45 @@ New statistics: `DAM dead victims`, `DAM LRU victims`, `DAM dead in other
 portion` (LRU evictions where a dead block existed in the *other* portion:
 the opportunity Stage 3's migration targets), RST training counts and the
 number of set-dueling phases won by threshold B.
+
+## Stage 2b: non-inclusive corrections to the dead-block predictor
+
+ChampSim's LLC is non-inclusive, so an L2 writeback can miss in the LLC (in
+DAM's inclusive LLC it always hits). Two switches address this:
+
+* `dam_writeback_reuse`: a writeback hit to a sampled block trains as reuse
+  (evicting a line that will receive a writeback forces a writeback-miss
+  allocation).
+* `dam_nopc_dead`: lines filled by a writeback miss (no trigger PC) are
+  predicted dead instead of never dead.
+
+| Config | `dam_writeback_reuse` | `dam_nopc_dead` |
+| --- | --- | --- |
+| `dam_dvs.json` (Stage 2) | off | off |
+| `dam_dvs2b.json` | on | on |
+| `dam_dvs2b_wb.json` | on | off |
+| `dam_dvs2b_nopc.json` | off | on |
+
+## Stage 3: DAM dead-block-based migration (`dam_dm.json`)
+
+Built on `dam_dvs2b_wb.json` (PHC placement + dead-block predictor with
+writeback hits counted as reuse) plus `dam_dm`. On a fill into a full
+portion (DAM Fig. 4a):
+
+1. A predicted-dead block in the target portion is evicted (DVS).
+2. Otherwise, if the *other* portion has a predicted-dead block (the least
+   recently used one is chosen), it is evicted and a block of the target
+   portion is migrated into its slot; the incoming block takes the freed way:
+   * incoming block -> SRAM: the most read-intensive SRAM block (lowest
+     per-block cost; ties: least recently used) moves to STT-RAM;
+   * incoming block -> STT-RAM: the most write-intensive STT-RAM block
+     (highest cost; ties: most recently used) moves to SRAM.
+3. Otherwise LRU within the target portion.
+
+Per-block cost: 8-bit signed, reset to 0 on fill, +24 per write hit and -1
+per read hit (the PHC deltas). The migrated block keeps its dirty bit,
+predictor metadata, cost and LRU position. Migration accounting: one read
+of the source medium and one write of the destination medium (counted in the
+SRAM/STT-RAM read/write totals and reserving their ports, off the critical
+path), plus `DAM migrations to SRAM` / `DAM migrations to STTRAM`. A dirty
+dead block is written back as for a normal eviction.

@@ -63,7 +63,9 @@ void to_json(nlohmann::json& j, const CACHE::stats_type& stats)
                                                   {"DAM reuse training", stats.dam_reuse_training},
                                                   {"DAM dead training", stats.dam_dead_training},
                                                   {"DAM dueling phases", stats.dam_phases},
-                                                  {"DAM dueling phases threshold B", stats.dam_phases_b}});
+                                                  {"DAM dueling phases threshold B", stats.dam_phases_b},
+                                                  {"DAM migrations to SRAM", stats.dam_migrations_to_sram},
+                                                  {"DAM migrations to STTRAM", stats.dam_migrations_to_sttram}});
 
   uint64_t total_downstream_demands = stats.fill.total();
   for (std::size_t cpu = 0; cpu < NUM_CPUS; ++cpu)

@@ -230,6 +230,15 @@ public:
     std::vector<uint8_t> block_has_pc{}; // 0 for lines with no trigger PC (e.g. writeback fills): never predicted dead
     uint64_t leader_misses_a = 0, leader_misses_b = 0, phase_misses = 0;
     bool followers_use_b = false;
+    bool writeback_reuse = false; // Stage 2b: writeback hits train as reuse
+    bool nopc_dead = false;       // Stage 2b: lines without a trigger PC are predicted dead
+    // Stage 3: dead-block-based migration (DM)
+    bool dm = false;
+    std::vector<int8_t> block_cost{}; // per-block 8-bit write-intensity cost (+write delta / +read delta per hit)
+    struct pending_migration_type {
+      bool valid = false;
+      long set = 0, from = 0, to = 0; // move block `from` into dead slot `to`; the incoming block then fills `from`
+    } pending{};
   };
   dam_state_type dam{};
 
@@ -237,6 +246,12 @@ public:
   [[nodiscard]] bool dam_dvs_enabled() const { return dam.enabled; }
   /** True if the valid block at (set, way) is predicted dead by the reuse-state table. */
   [[nodiscard]] bool dam_block_dead(long set, long way) const;
+  /** True if DAM dead-block-based migration (DM) is enabled. */
+  [[nodiscard]] bool dam_dm_enabled() const { return dam.dm; }
+  /** Per-block write-intensity cost used to pick the migration candidate. */
+  [[nodiscard]] int dam_block_cost(long set, long way) const;
+  /** Called by the replacement policy: move block `from` into dead slot `to`, then fill the incoming block into `from`. */
+  void dam_set_pending_migration(long set, long from, long to);
 
   using stats_type = cache_stats;
 
@@ -426,10 +441,17 @@ public:
       dam.threshold_a = std::min(256u, b.m_dam_threshold_a);
       dam.threshold_b = std::min(256u, b.m_dam_threshold_b);
       dam.phase_length = std::max(1u, b.m_dam_dueling_phase);
+      dam.writeback_reuse = b.m_dam_writeback_reuse;
+      dam.nopc_dead = b.m_dam_nopc_dead;
+      dam.dm = b.m_dam_dm;
       dam.rst.assign(256, static_cast<uint8_t>(dam.rst_init));
       dam.block_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
       dam.block_has_pc.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
+      if (dam.dm)
+        dam.block_cost.assign(static_cast<std::size_t>(NUM_SET) * NUM_WAY, 0);
     }
+    if (b.m_dam_dm && !b.m_dam_dvs)
+      throw std::invalid_argument{"dam_dm requires dam_dvs (it uses the dead-block predictor)"};
   }
 
   CACHE(const CACHE&) = delete;
