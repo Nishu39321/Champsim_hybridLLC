@@ -70,6 +70,11 @@ struct cache_builder_base {
   std::optional<uint64_t> m_sram_read_lat{}, m_sram_write_lat{}, m_sttram_read_lat{}, m_sttram_write_lat{};
   std::optional<uint32_t> m_sram_read_ports{}, m_sram_write_ports{}, m_sttram_read_ports{}, m_sttram_write_ports{};
   hybrid_llc_policy m_hybrid_policy{hybrid_llc_policy::read_stt_write_sram};
+  bool m_phc_predictor{};
+  int32_t m_phc_threshold{20};
+  int32_t m_phc_read_delta{-1};
+  int32_t m_phc_write_delta{24};
+  uint32_t m_phc_sampler_period{32};
 
   std::vector<access_type> m_pref_act_mask{access_type::LOAD, access_type::PREFETCH};
   std::vector<champsim::channel*> m_uls{};
@@ -244,6 +249,13 @@ public:
   self_type& sttram_write_ports(uint32_t ports_);
 
   self_type& hybrid_policy(hybrid_llc_policy policy_);
+
+  /** Enable PHC-style sampled write-intensity placement for a hybrid LLC. */
+  self_type& set_phc_predictor();
+  self_type& phc_threshold(int32_t threshold_);
+  self_type& phc_read_delta(int32_t delta_);
+  self_type& phc_write_delta(int32_t delta_);
+  self_type& phc_sampler_period(uint32_t period_);
 
   /**
    * Specify the ``access_type`` values that should activate the prefetcher.
@@ -593,6 +605,42 @@ template <typename P, typename R>
 auto champsim::cache_builder<P, R>::hybrid_policy(hybrid_llc_policy policy_) -> self_type&
 {
   m_hybrid_policy = policy_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::set_phc_predictor() -> self_type&
+{
+  m_hybrid_llc = true;
+  m_phc_predictor = true;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::phc_threshold(int32_t threshold_) -> self_type&
+{
+  m_phc_threshold = threshold_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::phc_read_delta(int32_t delta_) -> self_type&
+{
+  m_phc_read_delta = delta_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::phc_write_delta(int32_t delta_) -> self_type&
+{
+  m_phc_write_delta = delta_;
+  return *this;
+}
+
+template <typename P, typename R>
+auto champsim::cache_builder<P, R>::phc_sampler_period(uint32_t period_) -> self_type&
+{
+  m_phc_sampler_period = period_;
   return *this;
 }
 

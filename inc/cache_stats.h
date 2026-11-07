@@ -22,6 +22,10 @@ struct cache_stats {
   uint64_t sram_writes = 0;
   uint64_t sttram_reads = 0;
   uint64_t sttram_writes = 0;
+  uint64_t phc_sram_placements = 0;
+  uint64_t phc_sttram_placements = 0;
+  uint64_t phc_hot_training_events = 0;
+  uint64_t phc_cold_training_events = 0;
 
   champsim::stats::event_counter<std::pair<access_type, std::remove_cv_t<decltype(NUM_CPUS)>>> hits = {};
   champsim::stats::event_counter<std::pair<access_type, std::remove_cv_t<decltype(NUM_CPUS)>>> misses = {};

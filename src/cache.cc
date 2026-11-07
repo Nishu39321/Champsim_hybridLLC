@@ -42,11 +42,14 @@ CACHE::CACHE(CACHE&& other)
       cpu(other.cpu), NAME(std::move(other.NAME)), NUM_SET(other.NUM_SET), NUM_WAY(other.NUM_WAY), MSHR_SIZE(other.MSHR_SIZE), PQ_SIZE(other.PQ_SIZE),
       HIT_LATENCY(other.HIT_LATENCY), FILL_LATENCY(other.FILL_LATENCY), OFFSET_BITS(other.OFFSET_BITS), block(std::move(other.block)), MAX_TAG(other.MAX_TAG),
       MAX_FILL(other.MAX_FILL), prefetch_as_load(other.prefetch_as_load), match_offset_bits(other.match_offset_bits), virtual_prefetch(other.virtual_prefetch),
-      hybrid_llc(other.hybrid_llc), SRAM_WAYS(other.SRAM_WAYS), HYBRID_POLICY(other.HYBRID_POLICY), SRAM_READ_LATENCY(other.SRAM_READ_LATENCY),
+      hybrid_llc(other.hybrid_llc), SRAM_WAYS(other.SRAM_WAYS), HYBRID_POLICY(other.HYBRID_POLICY), PHC_PREDICTOR(other.PHC_PREDICTOR),
+      PHC_THRESHOLD(other.PHC_THRESHOLD), PHC_READ_DELTA(other.PHC_READ_DELTA), PHC_WRITE_DELTA(other.PHC_WRITE_DELTA),
+      PHC_SAMPLER_PERIOD(other.PHC_SAMPLER_PERIOD), SRAM_READ_LATENCY(other.SRAM_READ_LATENCY),
       SRAM_WRITE_LATENCY(other.SRAM_WRITE_LATENCY), STTRAM_READ_LATENCY(other.STTRAM_READ_LATENCY), STTRAM_WRITE_LATENCY(other.STTRAM_WRITE_LATENCY),
       sram_read_ports(std::move(other.sram_read_ports)), sram_write_ports(std::move(other.sram_write_ports)),
       sttram_read_ports(std::move(other.sttram_read_ports)), sttram_write_ports(std::move(other.sttram_write_ports)),
-      pref_activate_mask(std::move(other.pref_activate_mask)),
+      pref_activate_mask(std::move(other.pref_activate_mask)), phc_predictor(std::move(other.phc_predictor)),
+      phc_sampler(std::move(other.phc_sampler)), phc_sampler_clock(other.phc_sampler_clock),
 
       sim_stats(std::move(other.sim_stats)), roi_stats(std::move(other.roi_stats)),
 
@@ -87,6 +90,11 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
   this->hybrid_llc = other.hybrid_llc;
   this->SRAM_WAYS = other.SRAM_WAYS;
   this->HYBRID_POLICY = other.HYBRID_POLICY;
+  this->PHC_PREDICTOR = other.PHC_PREDICTOR;
+  this->PHC_THRESHOLD = other.PHC_THRESHOLD;
+  this->PHC_READ_DELTA = other.PHC_READ_DELTA;
+  this->PHC_WRITE_DELTA = other.PHC_WRITE_DELTA;
+  this->PHC_SAMPLER_PERIOD = other.PHC_SAMPLER_PERIOD;
   this->SRAM_READ_LATENCY = other.SRAM_READ_LATENCY;
   this->SRAM_WRITE_LATENCY = other.SRAM_WRITE_LATENCY;
   this->STTRAM_READ_LATENCY = other.STTRAM_READ_LATENCY;
@@ -96,6 +104,9 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
   this->sttram_read_ports = std::move(other.sttram_read_ports);
   this->sttram_write_ports = std::move(other.sttram_write_ports);
   this->pref_activate_mask = std::move(other.pref_activate_mask);
+  this->phc_predictor = std::move(other.phc_predictor);
+  this->phc_sampler = std::move(other.phc_sampler);
+  this->phc_sampler_clock = other.phc_sampler_clock;
   this->delayed_responses = std::move(other.delayed_responses);
 
   this->sim_stats = std::move(other.sim_stats);
@@ -133,6 +144,9 @@ CACHE::fill_type CACHE::fill_type::merge(fill_type predecessor, fill_type succes
                  std::back_inserter(merged_return));
 
   fill_type retval{(successor.type == access_type::PREFETCH) ? predecessor : successor};
+  // A merged request must retain the placement chosen when the original miss
+  // allocated the MSHR. A later demand request must not move an in-flight fill.
+  retval.target_sram = predecessor.target_sram;
 
   // set the time enqueued to the predecessor unless its a demand into prefetch, in which case we use the successor
   retval.time_enqueued =
@@ -190,12 +204,13 @@ bool CACHE::handle_fill(const fill_type& fill)
 
   // find victim
   auto [set_begin, set_end] = get_set_span(fill.address);
-  auto [medium_begin_idx, medium_end_idx] = hybrid_way_range(fill.type);
+  auto [medium_begin_idx, medium_end_idx] = hybrid_way_range(fill.target_sram);
   auto medium_begin = std::next(set_begin, medium_begin_idx);
   auto medium_end = std::next(set_begin, medium_end_idx);
   auto way = std::find_if_not(medium_begin, medium_end, [](auto x) { return x.valid; });
   if (way == medium_end) {
-    way = std::next(set_begin, impl_find_victim(fill.cpu, fill.instr_id, get_set_index(fill.address), &*set_begin, fill.ip, fill.address, fill.type));
+    way = std::next(set_begin,
+                    impl_find_victim(fill.cpu, fill.instr_id, get_set_index(fill.address), &*set_begin, fill.ip, fill.address, fill.type, fill.target_sram));
   }
   assert(medium_begin <= way);
   assert(way <= medium_end);
@@ -276,6 +291,8 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   auto way = std::find_if(set_begin, set_end, [matcher = matches_address(handle_pkt.address)](const auto& x) { return x.valid && matcher(x); });
   const auto hit = (way != set_end);
   const auto useful_prefetch = (hit && way->prefetch && !handle_pkt.prefetch_from_this);
+
+  phc_sampler_access(handle_pkt);
 
   if constexpr (champsim::debug_print) {
     fmt::print("[{}] {} instr_id: {} address: {} v_address: {} data: {} set: {} way: {} ({}) type: {} cycle: {}\n", NAME, __func__, handle_pkt.instr_id,
@@ -359,6 +376,7 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
   cpu = handle_pkt.cpu;
 
   auto mshr_pkt = mshr_and_forward_packet(handle_pkt);
+  mshr_pkt.first.target_sram = choose_fill_target(handle_pkt);
 
   // check mshr
   auto fill_entry = std::find_if(std::begin(MSHR), std::end(MSHR), matches_address(handle_pkt.address));
@@ -414,11 +432,12 @@ bool CACHE::handle_write(const tag_lookup_type& handle_pkt)
   }
 
   fill_type to_allocate{handle_pkt, current_time};
+  to_allocate.target_sram = choose_fill_target(handle_pkt);
   if (hybrid_llc && !warmup) {
     // A writeback miss allocates a line directly in this cache, so it does not
     // pass through finish_packet(). Account for the destination medium's write
     // latency and its write-port contention here instead.
-    const auto sram = target_is_sram(handle_pkt.type);
+    const auto sram = to_allocate.target_sram;
     const auto latency = medium_latency(sram, true);
     const auto start = reserve_medium_port(sram, true, latency);
     to_allocate.data_promise.ready_at(start + latency);
@@ -609,12 +628,97 @@ bool CACHE::target_is_sram(access_type type) const
 
 std::pair<long, long> CACHE::hybrid_way_range(access_type type) const
 {
+  return hybrid_way_range(target_is_sram(type));
+}
+
+std::pair<long, long> CACHE::hybrid_way_range(bool target_sram) const
+{
   if (!hybrid_llc)
     return {0, static_cast<long>(NUM_WAY)};
 
-  if (target_is_sram(type))
+  if (target_sram)
     return {0, static_cast<long>(SRAM_WAYS)};
   return {static_cast<long>(SRAM_WAYS), static_cast<long>(NUM_WAY)};
+}
+
+bool CACHE::choose_fill_target(const tag_lookup_type& request)
+{
+  if (!hybrid_llc)
+    return false;
+  if (SRAM_WAYS == 0)
+    return false;
+  if (SRAM_WAYS == NUM_WAY)
+    return true;
+
+  if (!PHC_PREDICTOR)
+    return target_is_sram(request.type);
+
+  // Writebacks have no useful trigger PC in ChampSim. Keep them in SRAM, and
+  // keep prefetches in STT-RAM, as defined for this first PHC baseline.
+  if (request.type == access_type::WRITE)
+    return true;
+  if (request.type == access_type::PREFETCH)
+    return false;
+
+  const auto predictor_index = static_cast<std::size_t>(request.ip.to<uint64_t>() & 0xfffULL);
+  const bool sram = phc_predictor.at(predictor_index) >= 2;
+  if (sram)
+    ++sim_stats.phc_sram_placements;
+  else
+    ++sim_stats.phc_sttram_placements;
+  return sram;
+}
+
+void CACHE::phc_train(uint16_t trigger_index, int16_t cost)
+{
+  auto& counter = phc_predictor.at(trigger_index);
+  if (cost >= PHC_THRESHOLD) {
+    counter = std::min<uint8_t>(3, static_cast<uint8_t>(counter + 1));
+    ++sim_stats.phc_hot_training_events;
+  } else {
+    counter = (counter == 0) ? 0 : static_cast<uint8_t>(counter - 1);
+    ++sim_stats.phc_cold_training_events;
+  }
+}
+
+void CACHE::phc_sampler_access(const tag_lookup_type& request)
+{
+  if (!PHC_PREDICTOR)
+    return;
+
+  const auto set = static_cast<uint32_t>(get_set_index(request.address));
+  if (set % PHC_SAMPLER_PERIOD != 0)
+    return;
+
+  const auto tag_shift = champsim::to_underlying(OFFSET_BITS) + champsim::lg2(NUM_SET);
+  const auto partial_tag = static_cast<uint16_t>((request.address.to<uint64_t>() >> tag_shift) & 0xffffULL);
+  const auto sampler_set = set / PHC_SAMPLER_PERIOD;
+  const auto begin_idx = static_cast<std::size_t>(sampler_set) * NUM_WAY;
+  auto begin = std::next(std::begin(phc_sampler), static_cast<long>(begin_idx));
+  auto end = std::next(begin, NUM_WAY);
+  auto entry = std::find_if(begin, end, [partial_tag](const auto& x) { return x.valid && x.partial_tag == partial_tag; });
+
+  const auto access_delta = (request.type == access_type::WRITE) ? PHC_WRITE_DELTA : PHC_READ_DELTA;
+  if (entry == end) {
+    // A writeback that misses the sampler has no trigger PC to train or store.
+    if (request.type == access_type::WRITE)
+      return;
+
+    entry = std::find_if(begin, end, [](const auto& x) { return !x.valid; });
+    if (entry == end) {
+      entry = std::min_element(begin, end, [](const auto& lhs, const auto& rhs) { return lhs.last_used < rhs.last_used; });
+      phc_train(entry->trigger_index, entry->cost);
+    }
+
+    entry->valid = true;
+    entry->partial_tag = partial_tag;
+    entry->trigger_index = static_cast<uint16_t>(request.ip.to<uint64_t>() & 0xfffULL);
+    entry->cost = 0;
+  }
+
+  const auto updated_cost = static_cast<int32_t>(entry->cost) + access_delta;
+  entry->cost = static_cast<int16_t>(std::clamp(updated_cost, -128, 127));
+  entry->last_used = phc_sampler_clock++;
 }
 
 champsim::chrono::clock::duration CACHE::medium_latency(bool sram, bool write) const
@@ -732,7 +836,7 @@ void CACHE::finish_packet(const response_type& packet)
   // MSHR holds the most updated information about this request
   fill_type::returned_value finished_value{packet.data, packet.pf_metadata};
   if (hybrid_llc && !warmup) {
-    const auto sram = target_is_sram(mshr_entry->type);
+    const auto sram = mshr_entry->target_sram;
     const auto latency = medium_latency(sram, true);
     const auto start = reserve_medium_port(sram, true, latency);
     mshr_entry->data_promise = champsim::waitable{finished_value, start + latency};
@@ -935,9 +1039,9 @@ void CACHE::impl_prefetcher_branch_operate(champsim::address ip, uint8_t branch_
 void CACHE::impl_initialize_replacement() const { repl_module_pimpl->impl_initialize_replacement(); }
 
 long CACHE::impl_find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const BLOCK* current_set, champsim::address ip, champsim::address full_addr,
-                             access_type type) const
+                             access_type type, bool target_sram) const
 {
-  return repl_module_pimpl->impl_find_victim(triggering_cpu, instr_id, set, current_set, ip, full_addr, type);
+  return repl_module_pimpl->impl_find_victim(triggering_cpu, instr_id, set, current_set, ip, full_addr, type, target_sram);
 }
 
 void CACHE::impl_update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
@@ -998,6 +1102,10 @@ void CACHE::end_phase(unsigned finished_cpu)
   roi_stats.sram_writes = sim_stats.sram_writes;
   roi_stats.sttram_reads = sim_stats.sttram_reads;
   roi_stats.sttram_writes = sim_stats.sttram_writes;
+  roi_stats.phc_sram_placements = sim_stats.phc_sram_placements;
+  roi_stats.phc_sttram_placements = sim_stats.phc_sttram_placements;
+  roi_stats.phc_hot_training_events = sim_stats.phc_hot_training_events;
+  roi_stats.phc_cold_training_events = sim_stats.phc_cold_training_events;
 
   for (auto* ul : upper_levels) {
     ul->roi_stats.RQ_ACCESS = ul->sim_stats.RQ_ACCESS;

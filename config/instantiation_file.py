@@ -100,7 +100,12 @@ cache_builder_parts = {
     'sram_write_ports': '.sram_write_ports({sram_write_ports})',
     'sttram_read_ports': '.sttram_read_ports({sttram_read_ports})',
     'sttram_write_ports': '.sttram_write_ports({sttram_write_ports})',
-    'hybrid_policy': '.hybrid_policy(champsim::hybrid_llc_policy::{hybrid_policy})'
+    'hybrid_policy': '.hybrid_policy(champsim::hybrid_llc_policy::{hybrid_policy})',
+    'phc_predictor': '.set_phc_predictor()',
+    'phc_threshold': '.phc_threshold({phc_threshold})',
+    'phc_read_delta': '.phc_read_delta({phc_read_delta})',
+    'phc_write_delta': '.phc_write_delta({phc_write_delta})',
+    'phc_sampler_period': '.phc_sampler_period({phc_sampler_period})'
 }
 
 ptw_builder_parts = {

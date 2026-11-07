@@ -124,6 +124,12 @@ std::vector<std::string> champsim::plain_printer::format(CACHE::stats_type stats
                                   stats.sram_reads, stats.sram_writes, stats.sttram_reads, stats.sttram_writes));
     }
 
+    if (stats.phc_sram_placements != 0 || stats.phc_sttram_placements != 0 || stats.phc_hot_training_events != 0 || stats.phc_cold_training_events != 0) {
+      lines.push_back(fmt::format("cpu{}->{} PHC PLACEMENTS SRAM: {:10} STTRAM: {:10} TRAINING HOT: {:10} COLD: {:10}", cpu, stats.name,
+                                  stats.phc_sram_placements, stats.phc_sttram_placements, stats.phc_hot_training_events,
+                                  stats.phc_cold_training_events));
+    }
+
     uint64_t total_downstream_demands = total_fill - stats.fill.value_or(std::pair{access_type::PREFETCH, cpu}, fill_value_type{});
     lines.push_back(
         fmt::format("cpu{}->{} AVERAGE MISS LATENCY: {} cycles", cpu, stats.name, ::print_ratio(stats.total_miss_latency_cycles, total_downstream_demands)));

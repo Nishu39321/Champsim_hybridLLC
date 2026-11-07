@@ -8,9 +8,10 @@ hybrid_lru::hybrid_lru(CACHE* cache_) : replacement(cache_), cache(cache_), NUM_
 {
 }
 
-long hybrid_lru::find_victim(uint32_t, uint64_t, long set, const champsim::cache_block*, champsim::address, champsim::address, access_type type)
+long hybrid_lru::find_victim(uint32_t, uint64_t, long set, const champsim::cache_block*, champsim::address, champsim::address, access_type,
+                             bool target_sram)
 {
-  const auto [first_way, last_way] = cache->hybrid_way_range(type);
+  const auto [first_way, last_way] = cache->hybrid_way_range(target_sram);
   assert(first_way < last_way);
   auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY + first_way);
   auto end = std::next(std::begin(last_used_cycles), set * NUM_WAY + last_way);

@@ -69,6 +69,9 @@ class CACHE : public champsim::operable
 
     access_type type;
     bool prefetch_from_this;
+    // Chosen once when the miss is allocated. It must remain stable through
+    // memory return and fill, even if placement policy later becomes dynamic.
+    bool target_sram = false;
     bool skip_fill;
     bool is_translated;
     bool translate_issued = false;
@@ -100,6 +103,7 @@ public:
 
     access_type type;
     bool prefetch_from_this;
+    bool target_sram = false;
 
     uint8_t asid[2] = {std::numeric_limits<uint8_t>::max(), std::numeric_limits<uint8_t>::max()};
 
@@ -147,9 +151,20 @@ private:
 
   bool is_sram_way(long way) const;
   bool target_is_sram(access_type type) const;
+  bool choose_fill_target(const tag_lookup_type& request);
+  void phc_sampler_access(const tag_lookup_type& request);
+  void phc_train(uint16_t trigger_index, int16_t cost);
   champsim::chrono::clock::duration medium_latency(bool sram, bool write) const;
   champsim::chrono::clock::time_point reserve_medium_port(bool sram, bool write, champsim::chrono::clock::duration latency);
   void count_medium_access(bool sram, bool write);
+
+  struct phc_sampler_entry {
+    bool valid = false;
+    uint16_t partial_tag = 0;
+    uint16_t trigger_index = 0;
+    int16_t cost = 0;
+    uint64_t last_used = 0;
+  };
 
   struct delayed_response {
     champsim::chrono::clock::time_point ready_at;
@@ -182,9 +197,15 @@ public:
   bool hybrid_llc;
   uint32_t SRAM_WAYS;
   champsim::hybrid_llc_policy HYBRID_POLICY;
+  bool PHC_PREDICTOR;
+  int32_t PHC_THRESHOLD, PHC_READ_DELTA, PHC_WRITE_DELTA;
+  uint32_t PHC_SAMPLER_PERIOD;
   champsim::chrono::clock::duration SRAM_READ_LATENCY, SRAM_WRITE_LATENCY, STTRAM_READ_LATENCY, STTRAM_WRITE_LATENCY;
   std::vector<champsim::chrono::clock::time_point> sram_read_ports, sram_write_ports, sttram_read_ports, sttram_write_ports;
   std::vector<access_type> pref_activate_mask;
+  std::vector<uint8_t> phc_predictor{};
+  std::vector<phc_sampler_entry> phc_sampler{};
+  uint64_t phc_sampler_clock = 0;
 
   using stats_type = cache_stats;
 
@@ -237,8 +258,10 @@ public:
 
   void print_deadlock() final;
 
-  /** Candidate way range for a fill of this type. Used by hybrid replacement policies. */
+  /** Candidate way range for a fill of this type. Used by legacy hybrid policies. */
   [[nodiscard]] std::pair<long, long> hybrid_way_range(access_type type) const;
+  /** Candidate way range for a fill whose placement was already decided. */
+  [[nodiscard]] std::pair<long, long> hybrid_way_range(bool target_sram) const;
 
 #include "module_decl.inc"
 
@@ -264,7 +287,7 @@ public:
 
     virtual void impl_initialize_replacement() = 0;
     virtual long impl_find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const BLOCK* current_set, champsim::address ip,
-                                  champsim::address full_addr, access_type type) = 0;
+                                  champsim::address full_addr, access_type type, bool target_sram) = 0;
     virtual void impl_update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
                                                champsim::address victim_addr, access_type type, bool hit) = 0;
     virtual void impl_replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
@@ -305,7 +328,7 @@ public:
 
     void impl_initialize_replacement() final;
     [[nodiscard]] long impl_find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const BLOCK* current_set, champsim::address ip,
-                                        champsim::address full_addr, access_type type) final;
+                                        champsim::address full_addr, access_type type, bool target_sram) final;
     void impl_update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
                                        champsim::address victim_addr, access_type type, bool hit) final;
     void impl_replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
@@ -328,7 +351,7 @@ public:
 
   void impl_initialize_replacement() const;
   [[nodiscard]] long impl_find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const BLOCK* current_set, champsim::address ip,
-                                      champsim::address full_addr, access_type type) const;
+                                      champsim::address full_addr, access_type type, bool target_sram) const;
   void impl_update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
                                      champsim::address victim_addr, access_type type, bool hit) const;
   void impl_replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
@@ -342,7 +365,9 @@ public:
         NUM_WAY(b.get_num_ways()), MSHR_SIZE(b.get_num_mshrs()), PQ_SIZE(b.m_pq_size), HIT_LATENCY(b.get_hit_latency() * b.m_clock_period),
         FILL_LATENCY(b.get_fill_latency() * b.m_clock_period), OFFSET_BITS(b.m_offset_bits), MAX_TAG(b.get_tag_bandwidth()), MAX_FILL(b.get_fill_bandwidth()),
         prefetch_as_load(b.m_pref_load), match_offset_bits(b.m_wq_full_addr), virtual_prefetch(b.m_va_pref), hybrid_llc(b.m_hybrid_llc),
-        SRAM_WAYS(b.m_sram_ways.value_or(NUM_WAY)), HYBRID_POLICY(b.m_hybrid_policy),
+        SRAM_WAYS(b.m_sram_ways.value_or(NUM_WAY)), HYBRID_POLICY(b.m_hybrid_policy), PHC_PREDICTOR(b.m_phc_predictor),
+        PHC_THRESHOLD(b.m_phc_threshold), PHC_READ_DELTA(b.m_phc_read_delta), PHC_WRITE_DELTA(b.m_phc_write_delta),
+        PHC_SAMPLER_PERIOD(b.m_phc_sampler_period),
         SRAM_READ_LATENCY(b.m_sram_read_lat.value_or(b.get_hit_latency()) * b.m_clock_period),
         SRAM_WRITE_LATENCY(b.m_sram_write_lat.value_or(b.get_fill_latency()) * b.m_clock_period),
         STTRAM_READ_LATENCY(b.m_sttram_read_lat.value_or(b.get_hit_latency()) * b.m_clock_period),
@@ -354,6 +379,12 @@ public:
   {
     if (SRAM_WAYS > NUM_WAY)
       throw std::invalid_argument{"Hybrid LLC SRAM ways cannot exceed total ways"};
+    if (PHC_PREDICTOR && (PHC_SAMPLER_PERIOD == 0 || NUM_SET % PHC_SAMPLER_PERIOD != 0))
+      throw std::invalid_argument{"PHC sampler period must evenly divide the number of cache sets"};
+    if (PHC_PREDICTOR) {
+      phc_predictor.assign(4096, 1); // weakly cold
+      phc_sampler.resize(static_cast<std::size_t>(NUM_SET / PHC_SAMPLER_PERIOD) * NUM_WAY);
+    }
   }
 
   CACHE(const CACHE&) = delete;
@@ -468,14 +499,20 @@ void CACHE::replacement_module_model<Rs...>::impl_initialize_replacement()
 
 template <typename... Rs>
 long CACHE::replacement_module_model<Rs...>::impl_find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const BLOCK* current_set,
-                                                              champsim::address ip, champsim::address full_addr, access_type type)
+                                                              champsim::address ip, champsim::address full_addr, access_type type, bool target_sram)
 {
   using return_type = long;
   [[maybe_unused]] auto process_one = [&](auto& r) {
     using namespace champsim::modules;
 
-    /* Strong addresses */
-    if constexpr (replacement::has_find_victim<decltype(r), uint32_t, uint64_t, long, const BLOCK*, champsim::address, champsim::address, access_type>)
+    /* Hybrid-aware strong addresses. */
+    if constexpr (replacement::has_find_victim<decltype(r), uint32_t, uint64_t, long, const BLOCK*, champsim::address, champsim::address, access_type,
+                                               bool>)
+      return return_type{r.find_victim(triggering_cpu, instr_id, set, current_set, ip, full_addr, type, target_sram)};
+
+    /* Legacy strong addresses. */
+    else if constexpr (replacement::has_find_victim<decltype(r), uint32_t, uint64_t, long, const BLOCK*, champsim::address, champsim::address,
+                                                        access_type>)
       return return_type{r.find_victim(triggering_cpu, instr_id, set, current_set, ip, full_addr, type)};
 
     /* Raw integer addresses */
