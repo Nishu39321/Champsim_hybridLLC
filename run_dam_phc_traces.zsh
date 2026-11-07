@@ -1,13 +1,20 @@
 #!/bin/zsh
-# Run the DAM-style SRAM, STT-RAM, and PHC-baseline configurations on every
-# trace in TRACE_DIR. Output is live on the terminal and is saved per run.
+# Run the DAM-style SRAM-only, STT-RAM-only, and PHC-baseline configurations on
+# every trace in TRACE_DIR, then collect the key metrics into one CSV.
+#
+#   WARMUP=10000000 SIMULATION=100000000 ./run_dam_phc_traces.zsh
+#
+# PARALLEL=1 runs the three configurations of each trace at the same time
+# (output goes only to the log files). PARALLEL=0 (default) runs one at a time
+# and shows the live heartbeat output in the terminal.
 
 set -euo pipefail
 
 CHAMPSIM_DIR="/Users/nishuverma/Downloads/ChampSim"
-TRACE_DIR="/Users/nishuverma/Desktop/traces"
+TRACE_DIR="${TRACE_DIR:-/Users/nishuverma/Desktop/traces}"
 WARMUP="${WARMUP:-10000000}"
 SIMULATION="${SIMULATION:-100000000}"
+PARALLEL="${PARALLEL:-0}"
 RUN_ID="$(date '+%Y%m%d_%H%M%S')"
 OUTDIR="${CHAMPSIM_DIR}/results/dam_phc_stage1_${RUN_ID}"
 
@@ -35,31 +42,25 @@ done
 
 command -v jq >/dev/null || { print -u2 "jq is required to create the CSV."; exit 1; }
 mkdir -p "$OUTDIR"
+print "Results directory: ${OUTDIR}"
+print "Warmup: ${WARMUP}  Simulation: ${SIMULATION}  Parallel: ${PARALLEL}"
 
 run_one() {
-  local workload="$1"
-  local config="$2"
-  local bin="$3"
-  local trace="$4"
+  local workload="$1" config="$2" bin="$3" trace="$4"
   local log="${OUTDIR}/${workload}_${config}.log"
   local json="${OUTDIR}/${workload}_${config}.json"
 
-  print ""
-  print "============================================================"
-  print "Starting workload: ${workload} | configuration: ${config}"
-  print "Log: ${log}"
-  print "============================================================"
-
-  # Do not add --hide-heartbeat. 'script' makes line-buffered heartbeats
-  # visible in both this terminal and the log file as they are produced.
-  /usr/bin/script -q /dev/null \
-    "$bin" \
-    --warmup-instructions "$WARMUP" \
-    --simulation-instructions "$SIMULATION" \
-    --json "$json" \
-    "$trace" 2>&1 | /usr/bin/tee "$log"
-
-  print "Finished workload: ${workload} | configuration: ${config}"
+  print "[$(date '+%H:%M:%S')] Starting ${workload} | ${config}  (log: ${log})"
+  if [[ "$PARALLEL" == "1" ]]; then
+    "$bin" --warmup-instructions "$WARMUP" --simulation-instructions "$SIMULATION" \
+      --json "$json" "$trace" > "$log" 2>&1
+  else
+    # 'script' keeps heartbeat lines flowing live to the terminal and the log.
+    /usr/bin/script -q /dev/null \
+      "$bin" --warmup-instructions "$WARMUP" --simulation-instructions "$SIMULATION" \
+      --json "$json" "$trace" 2>&1 | /usr/bin/tee "$log"
+  fi
+  print "[$(date '+%H:%M:%S')] Finished ${workload} | ${config}"
 }
 
 for trace in "${traces[@]}"; do
@@ -67,8 +68,13 @@ for trace in "${traces[@]}"; do
   workload="${trace_name%.champsimtrace.xz}"
 
   for index in {1..${#config_names}}; do
-    run_one "$workload" "${config_names[index]}" "${config_bins[index]}" "$trace"
+    if [[ "$PARALLEL" == "1" ]]; then
+      run_one "$workload" "${config_names[index]}" "${config_bins[index]}" "$trace" &
+    else
+      run_one "$workload" "${config_names[index]}" "${config_bins[index]}" "$trace"
+    fi
   done
+  [[ "$PARALLEL" == "1" ]] && wait
 done
 
 CSV="${OUTDIR}/stage1_comparison.csv"
@@ -76,20 +82,14 @@ print 'workload,configuration,instructions,cycles,ipc,llc_load_misses,llc_load_m
 
 for json in "${OUTDIR}"/*.json(N); do
   filename="${json:t}"
-  config="${filename##*_}"
-  config="${config%.json}"
-  workload="${filename%_*}"
-
-  # phc_wip includes an underscore, so recover it explicitly from the suffix.
   if [[ "$filename" == *_phc_wip.json ]]; then
-    config="phc_wip"
-    workload="${filename%_phc_wip.json}"
+    config="phc_wip";     workload="${filename%_phc_wip.json}"
   elif [[ "$filename" == *_sttram_only.json ]]; then
-    config="sttram_only"
-    workload="${filename%_sttram_only.json}"
+    config="sttram_only"; workload="${filename%_sttram_only.json}"
   elif [[ "$filename" == *_sram_only.json ]]; then
-    config="sram_only"
-    workload="${filename%_sram_only.json}"
+    config="sram_only";   workload="${filename%_sram_only.json}"
+  else
+    continue
   fi
 
   jq -r --arg workload "$workload" --arg config "$config" '
@@ -125,6 +125,6 @@ for json in "${OUTDIR}"/*.json(N); do
 done
 
 print ""
-print "All 12 runs completed."
+print "All $(( ${#traces} * ${#config_names} )) runs completed."
 print "Results directory: ${OUTDIR}"
 print "Comparison CSV: ${CSV}"

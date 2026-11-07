@@ -32,3 +32,31 @@ Build one configuration at a time:
 ./config.sh configs/dam_phc_wip.json
 make
 ```
+
+## Corrections after review (Stage 1, rev. 2)
+
+1. **Array write off the miss critical path.** Returned miss data (and
+   writeback-miss data) is installed after the normal `fill_latency`. The
+   array write still occupies a port of the destination medium for its full
+   latency (30 cycles SRAM, 120 cycles STT-RAM).
+2. **Shared ports per medium.** Reads and writes of one medium share the same
+   ports, so a bank busy with an STT-RAM write delays later reads.
+   `*_read_ports` sets the number of shared ports; `*_write_ports` is ignored.
+3. **One training event per access.** The PHC sampler is updated only when a
+   tag check completes (hit, accepted miss, or accepted writeback), not on
+   every retry of a miss stalled by a full MSHR. Placement is predicted once,
+   when a new MSHR entry is allocated, so merged misses no longer count as
+   placements.
+4. **Initial cost.** A sampler entry starts at cost 0 and the access that
+   inserts it is not counted (PHC Fig. 3).
+5. **Dirty data on merge.** A load that merges into an in-flight writeback
+   keeps the line dirty.
+
+The configuration files now set `executable_name`, so each build writes its
+own binary directly:
+
+```sh
+for c in sram_only sttram_only phc_wip; do
+  ./config.sh configs/dam_$c.json && make -j8 || break
+done
+```

@@ -104,6 +104,9 @@ public:
     access_type type;
     bool prefetch_from_this;
     bool target_sram = false;
+    // True if any request merged into this fill carried dirty (writeback) data.
+    // Kept separately from `type` because a merge may change the type to LOAD.
+    bool dirty = false;
 
     uint8_t asid[2] = {std::numeric_limits<uint8_t>::max(), std::numeric_limits<uint8_t>::max()};
 

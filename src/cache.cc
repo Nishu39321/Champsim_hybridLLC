@@ -129,7 +129,8 @@ CACHE::tag_lookup_type::tag_lookup_type(const request_type& req, bool local_pref
 
 CACHE::fill_type::fill_type(const tag_lookup_type& req, champsim::chrono::clock::time_point _time_enqueued)
     : address(req.address), v_address(req.v_address), ip(req.ip), instr_id(req.instr_id), cpu(req.cpu), type(req.type),
-      prefetch_from_this(req.prefetch_from_this), time_enqueued(_time_enqueued), instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
+      prefetch_from_this(req.prefetch_from_this), dirty(req.type == access_type::WRITE), time_enqueued(_time_enqueued),
+      instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
 {
 }
 
@@ -147,6 +148,8 @@ CACHE::fill_type CACHE::fill_type::merge(fill_type predecessor, fill_type succes
   // A merged request must retain the placement chosen when the original miss
   // allocated the MSHR. A later demand request must not move an in-flight fill.
   retval.target_sram = predecessor.target_sram;
+  // Fix 4: a load merging into an in-flight writeback must not drop its dirty data.
+  retval.dirty = predecessor.dirty || successor.dirty;
 
   // set the time enqueued to the predecessor unless its a demand into prefetch, in which case we use the successor
   retval.time_enqueued =
@@ -175,7 +178,7 @@ auto CACHE::fill_block(fill_type fill, uint32_t metadata) -> BLOCK
   CACHE::BLOCK to_fill;
   to_fill.valid = true;
   to_fill.prefetch = fill.prefetch_from_this;
-  to_fill.dirty = (fill.type == access_type::WRITE);
+  to_fill.dirty = fill.dirty || (fill.type == access_type::WRITE);
   to_fill.address = fill.address;
   to_fill.v_address = fill.v_address;
   to_fill.data = fill.data_promise->data;
@@ -292,7 +295,11 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   const auto hit = (way != set_end);
   const auto useful_prefetch = (hit && way->prefetch && !handle_pkt.prefetch_from_this);
 
-  phc_sampler_access(handle_pkt);
+  // Fix 2: a miss that cannot be accepted this cycle re-enters try_hit() on
+  // every retry. Train the sampler only when the access actually completes:
+  // here for hits, and in handle_miss()/handle_write() for accepted misses.
+  if (hit)
+    phc_sampler_access(handle_pkt);
 
   if constexpr (champsim::debug_print) {
     fmt::print("[{}] {} instr_id: {} address: {} v_address: {} data: {} set: {} way: {} ({}) type: {} cycle: {}\n", NAME, __func__, handle_pkt.instr_id,
@@ -376,7 +383,6 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
   cpu = handle_pkt.cpu;
 
   auto mshr_pkt = mshr_and_forward_packet(handle_pkt);
-  mshr_pkt.first.target_sram = choose_fill_target(handle_pkt);
 
   // check mshr
   auto fill_entry = std::find_if(std::begin(MSHR), std::end(MSHR), matches_address(handle_pkt.address));
@@ -412,12 +418,15 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
       return false;
     }
 
-    // Allocate an MSHR
+    // Allocate an MSHR. Fix 2: predict placement exactly once, only for a
+    // newly allocated miss (not for retries or for requests that merge).
     if (mshr_pkt.second.response_requested) {
+      mshr_pkt.first.target_sram = choose_fill_target(handle_pkt);
       MSHR.emplace_back(std::move(mshr_pkt.first));
     }
   }
 
+  phc_sampler_access(handle_pkt);
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
   return true;
@@ -435,17 +444,16 @@ bool CACHE::handle_write(const tag_lookup_type& handle_pkt)
   to_allocate.target_sram = choose_fill_target(handle_pkt);
   if (hybrid_llc && !warmup) {
     // A writeback miss allocates a line directly in this cache, so it does not
-    // pass through finish_packet(). Account for the destination medium's write
-    // latency and its write-port contention here instead.
+    // pass through finish_packet(). Fix 1: the array write occupies a port of
+    // the destination medium for its full latency, but the line is
+    // installed after the normal fill latency (nothing waits on its data).
     const auto sram = to_allocate.target_sram;
-    const auto latency = medium_latency(sram, true);
-    const auto start = reserve_medium_port(sram, true, latency);
-    to_allocate.data_promise.ready_at(start + latency);
-  } else {
-    to_allocate.data_promise.ready_at(current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY));
+    reserve_medium_port(sram, true, medium_latency(sram, true));
   }
+  to_allocate.data_promise.ready_at(current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY));
   inflight_fills.push_back(to_allocate);
 
+  phc_sampler_access(handle_pkt);
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
   return true;
@@ -710,10 +718,14 @@ void CACHE::phc_sampler_access(const tag_lookup_type& request)
       phc_train(entry->trigger_index, entry->cost);
     }
 
+    // Fix 3: PHC Fig. 3 -- the access that brings a block in starts its cost
+    // at zero; only later reads/writes to the block change the cost.
     entry->valid = true;
     entry->partial_tag = partial_tag;
     entry->trigger_index = static_cast<uint16_t>(request.ip.to<uint64_t>() & 0xfffULL);
     entry->cost = 0;
+    entry->last_used = phc_sampler_clock++;
+    return;
   }
 
   const auto updated_cost = static_cast<int32_t>(entry->cost) + access_delta;
@@ -730,7 +742,11 @@ champsim::chrono::clock::duration CACHE::medium_latency(bool sram, bool write) c
 
 champsim::chrono::clock::time_point CACHE::reserve_medium_port(bool sram, bool write, champsim::chrono::clock::duration latency)
 {
-  auto& ports = sram ? (write ? sram_write_ports : sram_read_ports) : (write ? sttram_write_ports : sttram_read_ports);
+  // Reads and writes of one medium share the same array ports (banks): a bank
+  // busy with a 120-cycle STT-RAM write cannot serve a read. The *_read_ports
+  // value sets the number of shared ports; *_write_ports is no longer used.
+  (void)write;
+  auto& ports = sram ? sram_read_ports : sttram_read_ports;
   auto next_port = std::min_element(std::begin(ports), std::end(ports));
   const auto start = std::max(current_time, *next_port);
   *next_port = start + latency;
@@ -836,13 +852,14 @@ void CACHE::finish_packet(const response_type& packet)
   // MSHR holds the most updated information about this request
   fill_type::returned_value finished_value{packet.data, packet.pf_metadata};
   if (hybrid_llc && !warmup) {
+    // Fix 1: forward the returned data to the upper level after the normal
+    // fill latency. The array write happens in the background: it holds a
+    // port of the destination medium for the full write latency (so it delays
+    // later reads and writes to that medium) but is not on the miss's critical path.
     const auto sram = mshr_entry->target_sram;
-    const auto latency = medium_latency(sram, true);
-    const auto start = reserve_medium_port(sram, true, latency);
-    mshr_entry->data_promise = champsim::waitable{finished_value, start + latency};
-  } else {
-    mshr_entry->data_promise = champsim::waitable{finished_value, current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY)};
+    reserve_medium_port(sram, true, medium_latency(sram, true));
   }
+  mshr_entry->data_promise = champsim::waitable{finished_value, current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY)};
   if constexpr (champsim::debug_print) {
     fmt::print("[{}_MSHR] finish_packet instr_id: {} address: {} data: {} type: {} current: {}\n", this->NAME, mshr_entry->instr_id, mshr_entry->address,
                mshr_entry->data_promise->data, access_type_names.at(champsim::to_underlying(mshr_entry->type)), current_time.time_since_epoch() / clock_period);

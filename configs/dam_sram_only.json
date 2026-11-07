@@ -1,17 +1,32 @@
 {
+  "executable_name": "champsim-dam-sram-only",
   "num_cores": 1,
-  "ooo_cpu": [{
-    "frequency": 2660,
-    "rob_size": 128,
-    "fetch_width": 4,
-    "decode_width": 4,
-    "dispatch_width": 4,
-    "execute_width": 4,
-    "retire_width": 4,
-    "L1I": { "sets": 128, "ways": 4, "latency": 4 },
-    "L1D": { "sets": 64, "ways": 8, "latency": 4 },
-    "L2C": { "sets": 512, "ways": 8, "latency": 8 }
-  }],
+  "ooo_cpu": [
+    {
+      "frequency": 2660,
+      "rob_size": 128,
+      "fetch_width": 4,
+      "decode_width": 4,
+      "dispatch_width": 4,
+      "execute_width": 4,
+      "retire_width": 4,
+      "L1I": {
+        "sets": 128,
+        "ways": 4,
+        "latency": 4
+      },
+      "L1D": {
+        "sets": 64,
+        "ways": 8,
+        "latency": 4
+      },
+      "L2C": {
+        "sets": 512,
+        "ways": 8,
+        "latency": 8
+      }
+    }
+  ],
   "LLC": {
     "sets": 8192,
     "ways": 16,

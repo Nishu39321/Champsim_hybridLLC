@@ -1,0 +1,462 @@
+diff --git a/configs/README-dam-phc-stage1.md b/configs/README-dam-phc-stage1.md
+index edcbfb0..7809bb9 100644
+--- a/configs/README-dam-phc-stage1.md
++++ b/configs/README-dam-phc-stage1.md
+@@ -32,3 +32,31 @@ Build one configuration at a time:
+ ./config.sh configs/dam_phc_wip.json
+ make
+ ```
++
++## Corrections after review (Stage 1, rev. 2)
++
++1. **Array write off the miss critical path.** Returned miss data (and
++   writeback-miss data) is installed after the normal `fill_latency`. The
++   array write still occupies a port of the destination medium for its full
++   latency (30 cycles SRAM, 120 cycles STT-RAM).
++2. **Shared ports per medium.** Reads and writes of one medium share the same
++   ports, so a bank busy with an STT-RAM write delays later reads.
++   `*_read_ports` sets the number of shared ports; `*_write_ports` is ignored.
++3. **One training event per access.** The PHC sampler is updated only when a
++   tag check completes (hit, accepted miss, or accepted writeback), not on
++   every retry of a miss stalled by a full MSHR. Placement is predicted once,
++   when a new MSHR entry is allocated, so merged misses no longer count as
++   placements.
++4. **Initial cost.** A sampler entry starts at cost 0 and the access that
++   inserts it is not counted (PHC Fig. 3).
++5. **Dirty data on merge.** A load that merges into an in-flight writeback
++   keeps the line dirty.
++
++The configuration files now set `executable_name`, so each build writes its
++own binary directly:
++
++```sh
++for c in sram_only sttram_only phc_wip; do
++  ./config.sh configs/dam_$c.json && make -j8 || break
++done
++```
+diff --git a/configs/dam_phc_wip.json b/configs/dam_phc_wip.json
+index 251ca45..b7ea601 100644
+--- a/configs/dam_phc_wip.json
++++ b/configs/dam_phc_wip.json
+@@ -1,17 +1,32 @@
+ {
++  "executable_name": "champsim-dam-phc-wip",
+   "num_cores": 1,
+-  "ooo_cpu": [{
+-    "frequency": 2660,
+-    "rob_size": 128,
+-    "fetch_width": 4,
+-    "decode_width": 4,
+-    "dispatch_width": 4,
+-    "execute_width": 4,
+-    "retire_width": 4,
+-    "L1I": { "sets": 128, "ways": 4, "latency": 4 },
+-    "L1D": { "sets": 64, "ways": 8, "latency": 4 },
+-    "L2C": { "sets": 512, "ways": 8, "latency": 8 }
+-  }],
++  "ooo_cpu": [
++    {
++      "frequency": 2660,
++      "rob_size": 128,
++      "fetch_width": 4,
++      "decode_width": 4,
++      "dispatch_width": 4,
++      "execute_width": 4,
++      "retire_width": 4,
++      "L1I": {
++        "sets": 128,
++        "ways": 4,
++        "latency": 4
++      },
++      "L1D": {
++        "sets": 64,
++        "ways": 8,
++        "latency": 4
++      },
++      "L2C": {
++        "sets": 512,
++        "ways": 8,
++        "latency": 8
++      }
++    }
++  ],
+   "LLC": {
+     "sets": 8192,
+     "ways": 16,
+diff --git a/configs/dam_sram_only.json b/configs/dam_sram_only.json
+index c352480..979bcde 100644
+--- a/configs/dam_sram_only.json
++++ b/configs/dam_sram_only.json
+@@ -1,17 +1,32 @@
+ {
++  "executable_name": "champsim-dam-sram-only",
+   "num_cores": 1,
+-  "ooo_cpu": [{
+-    "frequency": 2660,
+-    "rob_size": 128,
+-    "fetch_width": 4,
+-    "decode_width": 4,
+-    "dispatch_width": 4,
+-    "execute_width": 4,
+-    "retire_width": 4,
+-    "L1I": { "sets": 128, "ways": 4, "latency": 4 },
+-    "L1D": { "sets": 64, "ways": 8, "latency": 4 },
+-    "L2C": { "sets": 512, "ways": 8, "latency": 8 }
+-  }],
++  "ooo_cpu": [
++    {
++      "frequency": 2660,
++      "rob_size": 128,
++      "fetch_width": 4,
++      "decode_width": 4,
++      "dispatch_width": 4,
++      "execute_width": 4,
++      "retire_width": 4,
++      "L1I": {
++        "sets": 128,
++        "ways": 4,
++        "latency": 4
++      },
++      "L1D": {
++        "sets": 64,
++        "ways": 8,
++        "latency": 4
++      },
++      "L2C": {
++        "sets": 512,
++        "ways": 8,
++        "latency": 8
++      }
++    }
++  ],
+   "LLC": {
+     "sets": 8192,
+     "ways": 16,
+diff --git a/configs/dam_sttram_only.json b/configs/dam_sttram_only.json
+index 52d3efa..403932c 100644
+--- a/configs/dam_sttram_only.json
++++ b/configs/dam_sttram_only.json
+@@ -1,17 +1,32 @@
+ {
++  "executable_name": "champsim-dam-sttram-only",
+   "num_cores": 1,
+-  "ooo_cpu": [{
+-    "frequency": 2660,
+-    "rob_size": 128,
+-    "fetch_width": 4,
+-    "decode_width": 4,
+-    "dispatch_width": 4,
+-    "execute_width": 4,
+-    "retire_width": 4,
+-    "L1I": { "sets": 128, "ways": 4, "latency": 4 },
+-    "L1D": { "sets": 64, "ways": 8, "latency": 4 },
+-    "L2C": { "sets": 512, "ways": 8, "latency": 8 }
+-  }],
++  "ooo_cpu": [
++    {
++      "frequency": 2660,
++      "rob_size": 128,
++      "fetch_width": 4,
++      "decode_width": 4,
++      "dispatch_width": 4,
++      "execute_width": 4,
++      "retire_width": 4,
++      "L1I": {
++        "sets": 128,
++        "ways": 4,
++        "latency": 4
++      },
++      "L1D": {
++        "sets": 64,
++        "ways": 8,
++        "latency": 4
++      },
++      "L2C": {
++        "sets": 512,
++        "ways": 8,
++        "latency": 8
++      }
++    }
++  ],
+   "LLC": {
+     "sets": 8192,
+     "ways": 16,
+diff --git a/inc/cache.h b/inc/cache.h
+index c9dbe16..43d186e 100644
+--- a/inc/cache.h
++++ b/inc/cache.h
+@@ -104,6 +104,9 @@ public:
+     access_type type;
+     bool prefetch_from_this;
+     bool target_sram = false;
++    // True if any request merged into this fill carried dirty (writeback) data.
++    // Kept separately from `type` because a merge may change the type to LOAD.
++    bool dirty = false;
+ 
+     uint8_t asid[2] = {std::numeric_limits<uint8_t>::max(), std::numeric_limits<uint8_t>::max()};
+ 
+diff --git a/run_dam_phc_traces.zsh b/run_dam_phc_traces.zsh
+index d42dc0e..18539d6 100755
+--- a/run_dam_phc_traces.zsh
++++ b/run_dam_phc_traces.zsh
+@@ -1,13 +1,20 @@
+ #!/bin/zsh
+-# Run the DAM-style SRAM, STT-RAM, and PHC-baseline configurations on every
+-# trace in TRACE_DIR. Output is live on the terminal and is saved per run.
++# Run the DAM-style SRAM-only, STT-RAM-only, and PHC-baseline configurations on
++# every trace in TRACE_DIR, then collect the key metrics into one CSV.
++#
++#   WARMUP=10000000 SIMULATION=100000000 ./run_dam_phc_traces.zsh
++#
++# PARALLEL=1 runs the three configurations of each trace at the same time
++# (output goes only to the log files). PARALLEL=0 (default) runs one at a time
++# and shows the live heartbeat output in the terminal.
+ 
+ set -euo pipefail
+ 
+ CHAMPSIM_DIR="/Users/nishuverma/Downloads/ChampSim"
+-TRACE_DIR="/Users/nishuverma/Desktop/traces"
++TRACE_DIR="${TRACE_DIR:-/Users/nishuverma/Desktop/traces}"
+ WARMUP="${WARMUP:-10000000}"
+ SIMULATION="${SIMULATION:-100000000}"
++PARALLEL="${PARALLEL:-0}"
+ RUN_ID="$(date '+%Y%m%d_%H%M%S')"
+ OUTDIR="${CHAMPSIM_DIR}/results/dam_phc_stage1_${RUN_ID}"
+ 
+@@ -35,31 +42,25 @@ done
+ 
+ command -v jq >/dev/null || { print -u2 "jq is required to create the CSV."; exit 1; }
+ mkdir -p "$OUTDIR"
++print "Results directory: ${OUTDIR}"
++print "Warmup: ${WARMUP}  Simulation: ${SIMULATION}  Parallel: ${PARALLEL}"
+ 
+ run_one() {
+-  local workload="$1"
+-  local config="$2"
+-  local bin="$3"
+-  local trace="$4"
++  local workload="$1" config="$2" bin="$3" trace="$4"
+   local log="${OUTDIR}/${workload}_${config}.log"
+   local json="${OUTDIR}/${workload}_${config}.json"
+ 
+-  print ""
+-  print "============================================================"
+-  print "Starting workload: ${workload} | configuration: ${config}"
+-  print "Log: ${log}"
+-  print "============================================================"
+-
+-  # Do not add --hide-heartbeat. 'script' makes line-buffered heartbeats
+-  # visible in both this terminal and the log file as they are produced.
+-  /usr/bin/script -q /dev/null \
+-    "$bin" \
+-    --warmup-instructions "$WARMUP" \
+-    --simulation-instructions "$SIMULATION" \
+-    --json "$json" \
+-    "$trace" 2>&1 | /usr/bin/tee "$log"
+-
+-  print "Finished workload: ${workload} | configuration: ${config}"
++  print "[$(date '+%H:%M:%S')] Starting ${workload} | ${config}  (log: ${log})"
++  if [[ "$PARALLEL" == "1" ]]; then
++    "$bin" --warmup-instructions "$WARMUP" --simulation-instructions "$SIMULATION" \
++      --json "$json" "$trace" > "$log" 2>&1
++  else
++    # 'script' keeps heartbeat lines flowing live to the terminal and the log.
++    /usr/bin/script -q /dev/null \
++      "$bin" --warmup-instructions "$WARMUP" --simulation-instructions "$SIMULATION" \
++      --json "$json" "$trace" 2>&1 | /usr/bin/tee "$log"
++  fi
++  print "[$(date '+%H:%M:%S')] Finished ${workload} | ${config}"
+ }
+ 
+ for trace in "${traces[@]}"; do
+@@ -67,8 +68,13 @@ for trace in "${traces[@]}"; do
+   workload="${trace_name%.champsimtrace.xz}"
+ 
+   for index in {1..${#config_names}}; do
+-    run_one "$workload" "${config_names[index]}" "${config_bins[index]}" "$trace"
++    if [[ "$PARALLEL" == "1" ]]; then
++      run_one "$workload" "${config_names[index]}" "${config_bins[index]}" "$trace" &
++    else
++      run_one "$workload" "${config_names[index]}" "${config_bins[index]}" "$trace"
++    fi
+   done
++  [[ "$PARALLEL" == "1" ]] && wait
+ done
+ 
+ CSV="${OUTDIR}/stage1_comparison.csv"
+@@ -76,20 +82,14 @@ print 'workload,configuration,instructions,cycles,ipc,llc_load_misses,llc_load_m
+ 
+ for json in "${OUTDIR}"/*.json(N); do
+   filename="${json:t}"
+-  config="${filename##*_}"
+-  config="${config%.json}"
+-  workload="${filename%_*}"
+-
+-  # phc_wip includes an underscore, so recover it explicitly from the suffix.
+   if [[ "$filename" == *_phc_wip.json ]]; then
+-    config="phc_wip"
+-    workload="${filename%_phc_wip.json}"
++    config="phc_wip";     workload="${filename%_phc_wip.json}"
+   elif [[ "$filename" == *_sttram_only.json ]]; then
+-    config="sttram_only"
+-    workload="${filename%_sttram_only.json}"
++    config="sttram_only"; workload="${filename%_sttram_only.json}"
+   elif [[ "$filename" == *_sram_only.json ]]; then
+-    config="sram_only"
+-    workload="${filename%_sram_only.json}"
++    config="sram_only";   workload="${filename%_sram_only.json}"
++  else
++    continue
+   fi
+ 
+   jq -r --arg workload "$workload" --arg config "$config" '
+@@ -125,6 +125,6 @@ for json in "${OUTDIR}"/*.json(N); do
+ done
+ 
+ print ""
+-print "All 12 runs completed."
++print "All $(( ${#traces} * ${#config_names} )) runs completed."
+ print "Results directory: ${OUTDIR}"
+ print "Comparison CSV: ${CSV}"
+diff --git a/src/cache.cc b/src/cache.cc
+index 9696e6f..848f985 100644
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -129,7 +129,8 @@ CACHE::tag_lookup_type::tag_lookup_type(const request_type& req, bool local_pref
+ 
+ CACHE::fill_type::fill_type(const tag_lookup_type& req, champsim::chrono::clock::time_point _time_enqueued)
+     : address(req.address), v_address(req.v_address), ip(req.ip), instr_id(req.instr_id), cpu(req.cpu), type(req.type),
+-      prefetch_from_this(req.prefetch_from_this), time_enqueued(_time_enqueued), instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
++      prefetch_from_this(req.prefetch_from_this), dirty(req.type == access_type::WRITE), time_enqueued(_time_enqueued),
++      instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
+ {
+ }
+ 
+@@ -147,6 +148,8 @@ CACHE::fill_type CACHE::fill_type::merge(fill_type predecessor, fill_type succes
+   // A merged request must retain the placement chosen when the original miss
+   // allocated the MSHR. A later demand request must not move an in-flight fill.
+   retval.target_sram = predecessor.target_sram;
++  // Fix 4: a load merging into an in-flight writeback must not drop its dirty data.
++  retval.dirty = predecessor.dirty || successor.dirty;
+ 
+   // set the time enqueued to the predecessor unless its a demand into prefetch, in which case we use the successor
+   retval.time_enqueued =
+@@ -175,7 +178,7 @@ auto CACHE::fill_block(fill_type fill, uint32_t metadata) -> BLOCK
+   CACHE::BLOCK to_fill;
+   to_fill.valid = true;
+   to_fill.prefetch = fill.prefetch_from_this;
+-  to_fill.dirty = (fill.type == access_type::WRITE);
++  to_fill.dirty = fill.dirty || (fill.type == access_type::WRITE);
+   to_fill.address = fill.address;
+   to_fill.v_address = fill.v_address;
+   to_fill.data = fill.data_promise->data;
+@@ -292,7 +295,11 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
+   const auto hit = (way != set_end);
+   const auto useful_prefetch = (hit && way->prefetch && !handle_pkt.prefetch_from_this);
+ 
+-  phc_sampler_access(handle_pkt);
++  // Fix 2: a miss that cannot be accepted this cycle re-enters try_hit() on
++  // every retry. Train the sampler only when the access actually completes:
++  // here for hits, and in handle_miss()/handle_write() for accepted misses.
++  if (hit)
++    phc_sampler_access(handle_pkt);
+ 
+   if constexpr (champsim::debug_print) {
+     fmt::print("[{}] {} instr_id: {} address: {} v_address: {} data: {} set: {} way: {} ({}) type: {} cycle: {}\n", NAME, __func__, handle_pkt.instr_id,
+@@ -376,7 +383,6 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
+   cpu = handle_pkt.cpu;
+ 
+   auto mshr_pkt = mshr_and_forward_packet(handle_pkt);
+-  mshr_pkt.first.target_sram = choose_fill_target(handle_pkt);
+ 
+   // check mshr
+   auto fill_entry = std::find_if(std::begin(MSHR), std::end(MSHR), matches_address(handle_pkt.address));
+@@ -412,12 +418,15 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
+       return false;
+     }
+ 
+-    // Allocate an MSHR
++    // Allocate an MSHR. Fix 2: predict placement exactly once, only for a
++    // newly allocated miss (not for retries or for requests that merge).
+     if (mshr_pkt.second.response_requested) {
++      mshr_pkt.first.target_sram = choose_fill_target(handle_pkt);
+       MSHR.emplace_back(std::move(mshr_pkt.first));
+     }
+   }
+ 
++  phc_sampler_access(handle_pkt);
+   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
+ 
+   return true;
+@@ -435,17 +444,16 @@ bool CACHE::handle_write(const tag_lookup_type& handle_pkt)
+   to_allocate.target_sram = choose_fill_target(handle_pkt);
+   if (hybrid_llc && !warmup) {
+     // A writeback miss allocates a line directly in this cache, so it does not
+-    // pass through finish_packet(). Account for the destination medium's write
+-    // latency and its write-port contention here instead.
++    // pass through finish_packet(). Fix 1: the array write occupies a port of
++    // the destination medium for its full latency, but the line is
++    // installed after the normal fill latency (nothing waits on its data).
+     const auto sram = to_allocate.target_sram;
+-    const auto latency = medium_latency(sram, true);
+-    const auto start = reserve_medium_port(sram, true, latency);
+-    to_allocate.data_promise.ready_at(start + latency);
+-  } else {
+-    to_allocate.data_promise.ready_at(current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY));
++    reserve_medium_port(sram, true, medium_latency(sram, true));
+   }
++  to_allocate.data_promise.ready_at(current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY));
+   inflight_fills.push_back(to_allocate);
+ 
++  phc_sampler_access(handle_pkt);
+   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
+ 
+   return true;
+@@ -710,10 +718,14 @@ void CACHE::phc_sampler_access(const tag_lookup_type& request)
+       phc_train(entry->trigger_index, entry->cost);
+     }
+ 
++    // Fix 3: PHC Fig. 3 -- the access that brings a block in starts its cost
++    // at zero; only later reads/writes to the block change the cost.
+     entry->valid = true;
+     entry->partial_tag = partial_tag;
+     entry->trigger_index = static_cast<uint16_t>(request.ip.to<uint64_t>() & 0xfffULL);
+     entry->cost = 0;
++    entry->last_used = phc_sampler_clock++;
++    return;
+   }
+ 
+   const auto updated_cost = static_cast<int32_t>(entry->cost) + access_delta;
+@@ -730,7 +742,11 @@ champsim::chrono::clock::duration CACHE::medium_latency(bool sram, bool write) c
+ 
+ champsim::chrono::clock::time_point CACHE::reserve_medium_port(bool sram, bool write, champsim::chrono::clock::duration latency)
+ {
+-  auto& ports = sram ? (write ? sram_write_ports : sram_read_ports) : (write ? sttram_write_ports : sttram_read_ports);
++  // Reads and writes of one medium share the same array ports (banks): a bank
++  // busy with a 120-cycle STT-RAM write cannot serve a read. The *_read_ports
++  // value sets the number of shared ports; *_write_ports is no longer used.
++  (void)write;
++  auto& ports = sram ? sram_read_ports : sttram_read_ports;
+   auto next_port = std::min_element(std::begin(ports), std::end(ports));
+   const auto start = std::max(current_time, *next_port);
+   *next_port = start + latency;
+@@ -836,13 +852,14 @@ void CACHE::finish_packet(const response_type& packet)
+   // MSHR holds the most updated information about this request
+   fill_type::returned_value finished_value{packet.data, packet.pf_metadata};
+   if (hybrid_llc && !warmup) {
++    // Fix 1: forward the returned data to the upper level after the normal
++    // fill latency. The array write happens in the background: it holds a
++    // port of the destination medium for the full write latency (so it delays
++    // later reads and writes to that medium) but is not on the miss's critical path.
+     const auto sram = mshr_entry->target_sram;
+-    const auto latency = medium_latency(sram, true);
+-    const auto start = reserve_medium_port(sram, true, latency);
+-    mshr_entry->data_promise = champsim::waitable{finished_value, start + latency};
+-  } else {
+-    mshr_entry->data_promise = champsim::waitable{finished_value, current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY)};
++    reserve_medium_port(sram, true, medium_latency(sram, true));
+   }
++  mshr_entry->data_promise = champsim::waitable{finished_value, current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY)};
+   if constexpr (champsim::debug_print) {
+     fmt::print("[{}_MSHR] finish_packet instr_id: {} address: {} data: {} type: {} current: {}\n", this->NAME, mshr_entry->instr_id, mshr_entry->address,
+                mshr_entry->data_promise->data, access_type_names.at(champsim::to_underlying(mshr_entry->type)), current_time.time_since_epoch() / clock_period);
